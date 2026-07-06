@@ -395,7 +395,7 @@ export async function parsePromptWithAI(prompt: string): Promise<{ spec: ShapeSp
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 9000);
-    const res = await fetch('/api/chat', {
+    const res = await fetch('/api/chat-sync', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: controller.signal,

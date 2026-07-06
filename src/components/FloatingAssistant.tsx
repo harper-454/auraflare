@@ -73,7 +73,10 @@ export function FloatingAssistant({ currentSection, onNavigate }: FloatingAssist
     setIsLoading(true);
 
     try {
-      const res = await fetch('/api/chat', {
+      // The floating assistant uses the synchronous chat endpoint (the main
+      // NCP chat uses the durable async Workflow). /api/chat-sync is the
+      // single-shot contract kept for lightweight context-aware helpers.
+      const res = await fetch('/api/chat-sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: userMessage, context: currentSection })

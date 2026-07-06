@@ -21,13 +21,13 @@ The **MVP** is the **NCP Chat** (`src/components/NaturalConversationProgramming.
 
 ## What changed in the 2026-07-05 pass
 
-### 1. MVP chat — was silently broken, now real and local-first
+### 1. MVP chat — was silently broken, now durable and survives a closed browser
 - **Bug fixed:** the chat read `data.reply` but both runtimes return `data.text` → every AI message was persisted to Firestore as `"Processing error."` Now reads `data.text` + handles `data.error`.
-- **Decoupled from mandatory auth.** Chat now works the instant the app opens, no Google sign-in required. Messages persist to `localStorage` (`aura-chat-history`) always; when signed in, they also mirror to Firestore (`users/{uid}/chat`) as a sync overlay.
-- **Removed the blocking "Initializing Core Systems…" splash** in `AuthProvider` — app renders immediately; auth state resolves in the background.
-- **Copyable code blocks** on AI messages (extracts first ``` fence, one-click copy). The MVP is "natural language → code", so code is now first-class.
-- **Settings persist** (`aura-chat-settings`): provider/model/agent/project/memory.
-- **Clear-chat button** + visible LOCAL-ONLY / CLOUD-SYNC badge.
+- **Durable execution via Cloudflare Workflows.** This is the headline change. `POST /api/chat` no longer blocks; it creates a `ChatWorkflow` instance and returns `{instanceId, sessionId}` immediately. The Workflow runs server-side (`persist user msg → AI turn → self-evaluate done/blocked → loop or pause → finalize`), writing every message to D1 with its true role (`user`/`ai`/`system`) as it happens. **The AI keeps working after the browser closes** — reopening the page reads `/api/chat/history` and renders the full, correctly-attributed thread. The autonomous loop is capped at 6 turns; if the AI is blocked it writes a `system` question and pauses. This solves both "continues on close" and "exact preserved history."
+- **Single source of truth = D1** (`chat_messages`, `chat_runs` tables — see `migrations/0001_chat_history.sql`). The Firestore mirror was removed; D1 is the canonical store. localStorage only holds the `sessionId` so the client knows which thread to load.
+- **Sync fallback preserved.** If the Workflow binding is somehow missing (e.g. migration not yet applied), `/api/chat` returns `{text, fallback:'sync'}` and the client renders it directly — chat never breaks. `/api/chat-sync` is the dedicated single-shot endpoint for the `FloatingAssistant` and the 3D `composeWithAI`/`refineProgramWithAI` paths (those want one reply, now, not a multi-turn run).
+- **Removed the blocking "Initializing Core Systems…" splash** in `AuthProvider`.
+- **Copyable code blocks** on AI messages. "DURABLE" + "Survives tab close" badges make the behavior visible.
 
 ### 2. 3D Viewport — was a fake demo, now routes the real engine (and the engine got deeper)
 - The repo **already contained a complete real text-to-3D pipeline** in `src/lib/` (`meshforge.ts`, `sdf-compiler.ts`, `sdf-gpu.ts` — WGSL WebGPU kernel + CPU marching-tets fallback), but only the buried IDE → 3D tab exposed it. The visible "3D Viewport" sidebar item was a fake: `handleGenerate` was a 1.5s `setTimeout` that cycled Humanoid→Animal→Mech, and "Export Model" was an `alert("... (Mock)")`.
@@ -99,7 +99,10 @@ components. **Consolidating is a known follow-up** — low risk today, both work
 ### Dev server vs Worker
 | Route | `server.ts` (dev) | `worker.ts` (prod) |
 |---|---|---|
-| `/api/chat` | Gemini (GEMINI_API_KEY) | Workers AI via AI Gateway + KV cache |
+| `/api/chat` (POST) | Gemini sync, returns `{text, fallback:'sync'}` | **Durable Workflow** — returns `{instanceId, sessionId, status:'queued'}` immediately; AI keeps working after disconnect |
+| `/api/chat/status` (GET) | stub: always `complete` | real — polls a Workflow instance's status |
+| `/api/chat/history` (GET) | stub: empty | real — full thread from D1 `chat_messages` |
+| `/api/chat-sync` (POST) | Gemini single-shot | Workers AI single-shot (for FloatingAssistant + 3D compose) |
 | `/api/deep-research`, `/api/multi-agent-build` | Gemini | Workers AI |
 | `/api/spec` (GET/PUT) | — | D1 `spec_data` |
 | `/api/ai-stats` | — | D1 `ai_log` aggregate |
@@ -107,6 +110,36 @@ components. **Consolidating is a known follow-up** — low risk today, both work
 | `/api/fs/*`, `/api/exec` | real (workspace files + shell) | **501 by design** |
 
 So the **IDE Workspace** (file browser, terminal, git, Deploy/MCP/Claw views) is dev-only. In production those sub-views degrade gracefully (501 errors). This is intentional — the IDE is a local power tool.
+
+### Durable chat architecture (the part that solves "continues after close")
+
+```
+Browser                  Cloudflare Worker                D1
+  │  POST /api/chat {message,sessionId}                     │
+  │ ─────────────────────► creates ChatWorkflow instance    │
+  │ ◄───────────────────── {instanceId, sessionId}          │
+  │                          │                              │
+  │  (browser may close now) │ step: persist user msg ─────►│ chat_messages (role='user')
+  │                          │ step: AI turn ──────┐        │
+  │                          │                     │ Workers AI (kimi-k2.6 via AI Gateway)
+  │                          │ ◄───────────────────┘        │
+  │                          │ step: persist AI reply ─────►│ chat_messages (role='ai')
+  │                          │ step: self-evaluate ─────┐   │
+  │                          │   done? continue? blocked?   Workers AI
+  │                          │ ◄────────────────────────┘   │
+  │                          │ └ loop back to AI turn       │
+  │                          │   until done/blocked/cap(6)  │
+  │                          │ step: finalize ─────────────►│ chat_runs.status='complete'|'paused'
+  │                                                          │
+  │  GET /api/chat/history?sessionId=…  (on return or poll) │
+  │ ◄────────────────────── full thread, correctly roled ───│
+```
+
+Key invariants:
+- **Roles are never conflated.** The Workflow writes `role='user'` for the request and `role='ai'` for each reply as separate D1 rows. The old "AI message looks like it came from the user" bug is structurally impossible here.
+- **Idempotent steps.** Each `step.do(...)` is named; on Workflow retry after a transient failure the step does not re-run, so you never get duplicate messages.
+- **Bounded cost.** The loop is capped at `MAX_TURNS = 6`. The self-evaluate step defaults to `done` if the AI's JSON decision is malformed, so a buggy evaluation can't run forever.
+- **Reconnect anywhere.** `GET /api/chat/history?sessionId=…&sinceId=…` supports incremental polling (only messages after the last seen id) for live updates while the tab is open, and full-thread reads for "I came back later."
 
 ---
 

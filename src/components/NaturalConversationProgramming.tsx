@@ -1,24 +1,28 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
-  Terminal, Send, Command, FolderGit2, Monitor, Bot, Cpu, Sparkles,
-  Settings2, ChevronUp, Globe, Database, Search, HardDrive, Network,
-  Trash2, Cloud, CloudOff, Copy, Check, FileCode2
+  Terminal, Send, Command, FolderGit2, Bot, Cpu, Sparkles,
+  Settings2, Network, HardDrive, Trash2, Cloud, CloudOff,
+  Copy, Check, Loader2, CircleDot
 } from 'lucide-react';
 import Markdown from 'react-markdown';
-import { collection, query, orderBy, onSnapshot, addDoc, serverTimestamp } from 'firebase/firestore';
-import { db } from '../firebase';
-import { useAuth } from './AuthProvider';
 
-interface Message {
+// Durable chat: the AI runs in a Cloudflare Workflow that survives this
+// browser closing. POST /api/chat returns an instanceId immediately; we poll
+// /api/chat/history and render each turn as the Workflow writes it to D1.
+// Every message keeps its true role (user/ai/system) — never conflated.
+
+interface ServerMessage {
   id: string;
   role: 'user' | 'ai' | 'system';
   content: string;
-  timestamp: Date | any;
+  instance_id?: string;
+  created_at?: string;
 }
 
-const LOCAL_KEY = 'aura-chat-history';
+const SESSION_KEY = 'aura-chat-session';
 const SETTINGS_KEY = 'aura-chat-settings';
+const SEEN_KEY = 'aura-chat-seen-id'; // last message id rendered in this session
 
 interface ChatSettings {
   selectedAgent: string;
@@ -36,20 +40,6 @@ const DEFAULT_SETTINGS: ChatSettings = {
   memoryEnabled: true,
 };
 
-function loadLocalMessages(): Message[] {
-  try {
-    const raw = localStorage.getItem(LOCAL_KEY);
-    if (!raw) return [];
-    const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) return [];
-    return arr;
-  } catch { return []; }
-}
-
-function saveLocalMessages(msgs: Message[]) {
-  try { localStorage.setItem(LOCAL_KEY, JSON.stringify(msgs.slice(-200))); } catch { /* quota */ }
-}
-
 function loadSettings(): ChatSettings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
@@ -58,7 +48,6 @@ function loadSettings(): ChatSettings {
   } catch { return DEFAULT_SETTINGS; }
 }
 
-// Extract the first fenced code block from markdown, if any.
 function extractCode(md: string): { code: string; lang: string } | null {
   const m = md.match(/```([\w-]*)\n([\s\S]*?)```/);
   if (!m) return null;
@@ -91,25 +80,27 @@ function CodeMessage({ content }: { content: string }) {
 }
 
 export const NaturalConversationProgramming = () => {
-  const { user } = useAuth();
-  const [messages, setMessages] = useState<Message[]>(() => {
-    const local = loadLocalMessages();
-    if (local.length === 0) {
-      return [{
-        id: 'sys-init',
-        role: 'system',
-        content: 'Aura Engine Core initialized. Type a request — e.g. "generate a React counter component" or "write a Cloudflare Worker that proxies an API". Code is rendered inline and copyable.',
-        timestamp: new Date()
-      }];
-    }
-    return local;
+  const [sessionId] = useState<string>(() => {
+    const existing = localStorage.getItem(SESSION_KEY);
+    if (existing) return existing;
+    const id = crypto.randomUUID();
+    localStorage.setItem(SESSION_KEY, id);
+    return id;
   });
+
+  const [messages, setMessages] = useState<ServerMessage[]>([]);
   const [input, setInput] = useState('');
   const [isOptionsOpen, setIsOptionsOpen] = useState(false);
-  const [isGenerating, setIsGenerating] = useState(false);
+  const [settings, setSettings] = useState<ChatSettings>(() => loadSettings());
   const [error, setError] = useState<string | null>(null);
 
-  const [settings, setSettings] = useState<ChatSettings>(() => loadSettings());
+  // Per-run tracking. activeRun = the instanceId we're currently polling.
+  const [activeRun, setActiveRun] = useState<string | null>(null);
+  const [runStatus, setRunStatus] = useState<string>('idle'); // idle | queued | running | paused | complete | errored
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const seenIdRef = useRef<string>(localStorage.getItem(SEEN_KEY) || '');
+
   const updateSetting = <K extends keyof ChatSettings>(k: K, v: ChatSettings[K]) => {
     setSettings(prev => {
       const next = { ...prev, [k]: v };
@@ -118,61 +109,103 @@ export const NaturalConversationProgramming = () => {
     });
   };
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  // ── Load history on mount (this is what makes "leave and come back" work).
+  // Whatever the Workflow produced while you were away is right here.
+  const refreshHistory = useCallback(async (): Promise<ServerMessage[]> => {
+    try {
+      const url = `/api/chat/history?sessionId=${encodeURIComponent(sessionId)}` +
+        (seenIdRef.current ? `&sinceId=${encodeURIComponent(seenIdRef.current)}` : '');
+      const res = await fetch(url);
+      if (!res.ok) return [];
+      const data = await res.json();
+      const msgs: ServerMessage[] = (data.messages ?? []).map((m: any) => ({
+        id: m.id, role: m.role, content: m.content, instance_id: m.instance_id, created_at: m.created_at,
+      }));
+      if (msgs.length > 0) {
+        // advance the cursor
+        seenIdRef.current = msgs[msgs.length - 1].id;
+        localStorage.setItem(SEEN_KEY, seenIdRef.current);
+        setMessages(prev => {
+          const existing = new Set(prev.map(m => m.id));
+          const merged = [...prev, ...msgs.filter(m => !existing.has(m.id))];
+          return merged;
+        });
+      }
+      return msgs;
+    } catch { return []; }
+  }, [sessionId]);
 
-  // ——— Cloud sync overlay (only when signed in) ———
-  // When the user authenticates, we attach a Firestore listener and merge any
-  // cloud history that isn't already in local state. We never block the UI on
-  // auth: chat works instantly, sign-in just adds cross-device sync.
+  // Initial load + on sessionId change
   useEffect(() => {
-    if (!user) return;
-    const q = query(collection(db, 'users', user.uid, 'chat'), orderBy('timestamp', 'asc'));
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      if (snapshot.empty) return;
-      const cloud = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Message[];
-      setMessages(prev => {
-        const ids = new Set(prev.map(m => m.id));
-        const merged = [...prev];
-        let changed = false;
-        for (const m of cloud) {
-          if (!ids.has(m.id)) { merged.push(m); changed = true; }
-        }
-        return changed ? merged.sort((a, b) => {
-          const ta = a.timestamp?.toMillis?.() ?? (a.timestamp instanceof Date ? a.timestamp.getTime() : 0);
-          const tb = b.timestamp?.toMillis?.() ?? (b.timestamp instanceof Date ? b.timestamp.getTime() : 0);
-          return ta - tb;
-        }) : prev;
-      });
+    // On a fresh session, show a welcome message. On a returning session,
+    // history will populate from the server.
+    refreshHistory().then((msgs) => {
+      if (msgs.length === 0 && !localStorage.getItem('aura-chat-seen-init')) {
+        localStorage.setItem('aura-chat-seen-init', '1');
+        setMessages([{
+          id: 'sys-init',
+          role: 'system',
+          content: 'Aura Engine initialized. Describe what to build — the AI keeps working even after you close this tab, and your full history is preserved when you return.',
+          created_at: new Date().toISOString(),
+        }]);
+      }
     });
-    return unsubscribe;
-  }, [user]);
+  }, [refreshHistory]);
+
+  // ── Poll an active run until it finishes (or pauses for input).
+  useEffect(() => {
+    if (!activeRun) return;
+    let cancelled = false;
+
+    const poll = async () => {
+      if (cancelled) return;
+      // Pull any new messages AND the run status together.
+      await refreshHistory();
+      try {
+        const res = await fetch(`/api/chat/status?instanceId=${encodeURIComponent(activeRun!)}`);
+        if (res.ok) {
+          const data = await res.json();
+          const s = data.run || data.status || 'running';
+          setRunStatus(s);
+          if (s === 'complete' || s === 'errored') {
+            // Final drain, then stop polling.
+            await refreshHistory();
+            setActiveRun(null);
+            setRunStatus('idle');
+            return;
+          }
+          if (s === 'paused') {
+            // Blocked — keep the run active in the UI so the user sees the question.
+            // We stop polling; the user replies with a new message which starts a new run.
+            setActiveRun(null);
+            return;
+          }
+        }
+      } catch { /* transient — keep polling */ }
+      pollRef.current = setTimeout(poll, 1500);
+    };
+
+    poll();
+    return () => {
+      cancelled = true;
+      if (pollRef.current) clearTimeout(pollRef.current);
+    };
+  }, [activeRun, refreshHistory]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const persistLocal = useCallback((msgs: Message[]) => {
-    saveLocalMessages(msgs);
-  }, []);
-
   const handleSend = async () => {
-    if (!input.trim() || isGenerating) return;
-
+    if (!input.trim() || activeRun) return; // don't queue two runs at once
     const userText = input.trim();
-    const userMsg: Message = {
-      id: `u-${Date.now()}`,
-      role: 'user',
-      content: userText,
-      timestamp: new Date()
-    };
-    setMessages(prev => {
-      const next = [...prev, userMsg];
-      persistLocal(next);
-      return next;
-    });
     setInput('');
-    setIsGenerating(true);
     setError(null);
+
+    // Optimistic: show the user's message immediately.
+    const tempId = `pending-${Date.now()}`;
+    setMessages(prev => [...prev, { id: tempId, role: 'user', content: userText, created_at: new Date().toISOString() }]);
+    setRunStatus('queued');
 
     try {
       const res = await fetch('/api/chat', {
@@ -181,75 +214,68 @@ export const NaturalConversationProgramming = () => {
         body: JSON.stringify({
           message: userText,
           context: 'chat',
+          sessionId,
           model: settings.selectedModel,
           agent: settings.selectedAgent,
           provider: settings.selectedProvider,
           project: settings.selectedProject,
-          memory: settings.memoryEnabled
-        })
+          memory: settings.memoryEnabled,
+        }),
       });
-
       const data = await res.json();
+
       if (!res.ok || data.error) {
         throw new Error(data.error || `Request failed (${res.status})`);
       }
 
-      // Server returns { text } — never { reply }. The old code read data.reply
-      // and so every AI message was persisted as "Processing error."
-      const replyText: string = data.text || '*(empty response)*';
-      const aiMsg: Message = {
-        id: `ai-${Date.now()}`,
-        role: 'ai',
-        content: replyText,
-        timestamp: new Date()
-      };
-      setMessages(prev => {
-        const next = [...prev, aiMsg];
-        if (settings.memoryEnabled) {
-          next.push({
-            id: `sys-${Date.now()}`,
-            role: 'system',
-            content: `Context synced → [${settings.selectedProject}] · provider: ${settings.selectedProvider}`,
-            timestamp: new Date()
-          });
-        }
-        persistLocal(next);
-        return next;
-      });
-
-      // Mirror to Firestore when signed in (best-effort; failures are non-fatal)
-      if (user) {
-        const base = { content: undefined as any, timestamp: serverTimestamp() };
-        addDoc(collection(db, 'users', user.uid, 'chat'), { ...base, role: 'user', content: userText }).catch(() => {});
-        addDoc(collection(db, 'users', user.uid, 'chat'), { ...base, role: 'ai', content: replyText }).catch(() => {});
+      if (data.fallback === 'sync' && typeof data.text === 'string') {
+        // Edge had no Workflow binding (e.g. migration not deployed yet) and
+        // returned a single synchronous reply. Render it directly.
+        setRunStatus('idle');
+        seenIdRef.current = '';
+        setMessages(prev => [
+          ...prev.filter(m => m.id !== tempId),
+          { id: `ai-${Date.now()}`, role: 'ai' as const, content: data.text, created_at: new Date().toISOString() },
+        ]);
+        return;
       }
-    } catch (error: any) {
-      console.error(error);
-      setError(error.message || 'Unknown error');
-      setMessages(prev => {
-        const next = [...prev, {
-          id: `err-${Date.now()}`,
-          role: 'system' as const,
-          content: `⚠️ ${error.message || 'Error communicating with AI Gateway.'} — your message is preserved locally.`,
-          timestamp: new Date()
-        }];
-        persistLocal(next);
-        return next;
-      });
-    } finally {
-      setIsGenerating(false);
+
+      // Durable path: a Workflow instance is now running server-side.
+      // Drop the optimistic temp message (the real one will arrive via history
+      // polling with its proper server id), and start polling.
+      setMessages(prev => prev.filter(m => m.id !== tempId));
+      setActiveRun(data.instanceId);
+      setRunStatus('running');
+      // immediate first poll so the user's own message reappears quickly
+      refreshHistory();
+    } catch (e: any) {
+      setError(e.message || 'Failed to start the AI workflow.');
+      setRunStatus('idle');
+      // keep the optimistic user message so they know what they asked
     }
   };
 
-  const clearChat = () => {
-    if (!confirm('Clear this conversation? Local history will be removed.')) return;
-    localStorage.removeItem(LOCAL_KEY);
+  const clearChat = async () => {
+    if (!confirm('Start a fresh conversation? This clears the local view. The cloud history remains until you clear it from the dashboard.')) return;
+    localStorage.removeItem(SESSION_KEY);
+    localStorage.removeItem(SEEN_KEY);
+    localStorage.removeItem('aura-chat-seen-init');
+    seenIdRef.current = '';
+    setActiveRun(null);
+    setRunStatus('idle');
     setMessages([{
       id: 'sys-init',
       role: 'system',
-      content: 'Conversation cleared. Ready when you are.',
-      timestamp: new Date()
+      content: 'New conversation started. Ready when you are.',
+      created_at: new Date().toISOString(),
     }]);
+    // reload to pick up a fresh sessionId
+    setTimeout(() => window.location.reload(), 100);
+  };
+
+  const busy = activeRun !== null;
+  const statusLabel: Record<string, string> = {
+    idle: '', queued: 'Queued…', running: 'Working…', paused: 'Needs input', complete: 'Done', errored: 'Error',
   };
 
   return (
@@ -260,15 +286,18 @@ export const NaturalConversationProgramming = () => {
           <Terminal className="text-indigo-400" /> Natural Conversation Programming
         </h2>
         <div className="flex items-center gap-3">
-          <span className={`flex items-center gap-1.5 text-xs font-mono px-3 py-1 rounded-full border ${user
-            ? 'text-emerald-400 bg-emerald-400/10 border-emerald-500/20'
-            : 'text-slate-400 bg-slate-700/30 border-slate-600/40'}`}>
-            {user ? <Cloud className="w-3 h-3" /> : <CloudOff className="w-3 h-3" />}
-            {user ? 'CLOUD SYNC' : 'LOCAL ONLY'}
+          {busy && (
+            <span className="flex items-center gap-1.5 text-xs font-mono px-3 py-1 rounded-full border bg-indigo-500/10 border-indigo-500/30 text-indigo-300">
+              <Loader2 className="w-3 h-3 animate-spin" />
+              {statusLabel[runStatus] || 'Working…'}
+            </span>
+          )}
+          <span className="flex items-center gap-1.5 text-xs font-mono px-3 py-1 rounded-full border bg-emerald-400/10 border-emerald-500/20 text-emerald-400">
+            <Cloud className="w-3 h-3" /> DURABLE
           </span>
           <button
             onClick={clearChat}
-            title="Clear conversation"
+            title="Start fresh"
             className="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-rose-300 transition-colors"
           >
             <Trash2 className="w-4 h-4" />
@@ -284,9 +313,9 @@ export const NaturalConversationProgramming = () => {
 
       <div className="flex-1 overflow-y-auto p-6 md:p-10 space-y-8">
         <AnimatePresence>
-          {messages.map((msg, i) => (
+          {messages.map((msg) => (
             <motion.div
-              key={msg.id || i}
+              key={msg.id}
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
               className={`flex gap-4 max-w-4xl ${msg.role === 'user' ? 'ml-auto flex-row-reverse' : ''}`}
@@ -307,6 +336,11 @@ export const NaturalConversationProgramming = () => {
                   <span className="font-bold uppercase tracking-wider text-slate-400">
                     {msg.role === 'user' ? 'You' : msg.role === 'system' ? 'System' : 'Aura'}
                   </span>
+                  {msg.instance_id && msg.role === 'ai' && (
+                    <span className="flex items-center gap-0.5 text-[9px] text-emerald-600">
+                      <CircleDot className="w-2.5 h-2.5" /> durable
+                    </span>
+                  )}
                 </div>
                 <div className={`p-4 rounded-xl border ${
                   msg.role === 'user'
@@ -322,7 +356,7 @@ export const NaturalConversationProgramming = () => {
               </div>
             </motion.div>
           ))}
-          {isGenerating && (
+          {busy && (
             <motion.div
               initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
@@ -337,7 +371,9 @@ export const NaturalConversationProgramming = () => {
                   <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
                   <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
                 </div>
-                <span className="text-xs font-mono text-emerald-500/70">Generating…</span>
+                <span className="text-xs font-mono text-emerald-500/70">
+                  {runStatus === 'queued' ? 'Queued…' : 'Working — safe to close this tab'}
+                </span>
               </div>
             </motion.div>
           )}
@@ -346,8 +382,9 @@ export const NaturalConversationProgramming = () => {
       </div>
 
       {error && (
-        <div className="mx-6 mb-2 px-4 py-2 bg-rose-500/10 border border-rose-500/30 rounded-lg text-xs text-rose-300 font-mono">
-          {error}
+        <div className="mx-6 mb-2 px-4 py-2 bg-rose-500/10 border border-rose-500/30 rounded-lg text-xs text-rose-300 font-mono flex items-center justify-between">
+          <span>{error}</span>
+          <button onClick={() => setError(null)} className="text-rose-400 hover:text-rose-200 ml-3">dismiss</button>
         </div>
       )}
 
@@ -442,28 +479,27 @@ export const NaturalConversationProgramming = () => {
                 handleSend();
               }
             }}
-            placeholder="Describe what to build, or ask for code…  (e.g. 'a React hook for debounced search')"
-            className="w-full bg-slate-900 border border-slate-800 rounded-xl pl-4 pr-16 py-4 text-slate-200 placeholder:text-slate-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none resize-none overflow-hidden"
+            placeholder={busy ? 'Aura is working — safe to close the tab…' : 'Describe what to build. The AI keeps working after you leave…'}
+            disabled={busy}
+            className="w-full bg-slate-900 border border-slate-800 rounded-xl pl-4 pr-16 py-4 text-slate-200 placeholder:text-slate-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none resize-none overflow-hidden disabled:opacity-60"
             rows={1}
             style={{ minHeight: '60px', maxHeight: '200px' }}
           />
           <button
             onClick={handleSend}
-            disabled={!input.trim() || isGenerating}
+            disabled={!input.trim() || busy}
             className="absolute right-2 top-2 p-3 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-600 text-white rounded-lg transition-colors flex items-center justify-center"
           >
-            <Send className="w-4 h-4" />
+            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
           </button>
         </div>
         <div className="mt-3 flex items-center justify-between text-xs text-slate-500 font-mono">
           <div className="flex gap-4 items-center flex-wrap">
             <span className="flex items-center gap-1"><Command className="w-3 h-3" /> + Enter to send</span>
-            <span className="flex items-center gap-1"><Sparkles className="w-3 h-3 text-indigo-400" /> Context aware</span>
-            {settings.memoryEnabled && (
-              <span className="flex items-center gap-1 px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-                <FileCode2 className="w-3 h-3" /> Code blocks copyable
-              </span>
-            )}
+            <span className="flex items-center gap-1"><Sparkles className="w-3 h-3 text-indigo-400" /> Durable workflow</span>
+            <span className="flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+              <Cloud className="w-3 h-3" /> Survives tab close
+            </span>
           </div>
           <span>≈{Math.round(input.length * 0.25)} tokens</span>
         </div>

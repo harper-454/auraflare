@@ -15,6 +15,17 @@
   "workers_dev": true,
   "compatibility_flags": ["nodejs_compat"],
 
+  // Durable chat: the Workflow class lives in src/worker.ts and is bound here.
+  // Instances are created per POST /api/chat; they keep working after the
+  // browser disconnects and persist every message to D1 as it happens.
+  "workflows": [
+    {
+      "name": "aura-chat",
+      "binding": "CHAT_WORKFLOW",
+      "class_name": "ChatWorkflow"
+    }
+  ],
+
   // Serve the built SPA via Workers Static Assets
   "assets": {
     "directory": "./dist",

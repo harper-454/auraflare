@@ -767,7 +767,7 @@ export async function composeWithAI(prompt: string): Promise<{ program: ShapePro
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 20000);
-    const res = await fetch('/api/chat', {
+    const res = await fetch('/api/chat-sync', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: controller.signal,
@@ -801,7 +801,7 @@ export async function refineProgramWithAI(current: ShapeProgram, instruction: st
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 20000);
-    const res = await fetch('/api/chat', {
+    const res = await fetch('/api/chat-sync', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: controller.signal,

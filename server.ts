@@ -61,10 +61,16 @@ async function startServer() {
   });
 
 
+  // ── Durable chat: in production this is a Cloudflare Workflow (the AI keeps
+  // working after the browser closes). In local dev there's no Workflow
+  // runtime, so /api/chat degrades to synchronous and tags itself with
+  // { fallback: 'sync' } — the client renders the reply directly. The
+  // dedicated /api/chat-sync endpoint below carries the same single-shot
+  // contract for the FloatingAssistant + 3D compose path.
   app.post('/api/chat', async (req, res) => {
     try {
       const { message, context } = req.body;
-      
+
       const apiKey = process.env.GEMINI_API_KEY;
       if (!apiKey) {
         return res.status(500).json({ error: 'GEMINI_API_KEY environment variable is missing.' });
@@ -73,7 +79,7 @@ async function startServer() {
       const ai = new GoogleGenAI({ apiKey });
 
       const prompt = `
-You are a helpful context-aware assistant for the Aura Engine Specification platform. 
+You are a helpful context-aware assistant for the Aura Engine Specification platform.
 The user is currently viewing the "${context}" section.
 
 Answer the following query clearly and concisely based on the current context and typical software architecture concepts.
@@ -89,15 +95,16 @@ User Query: ${message}
         contents: prompt,
       });
 
-      res.json({ text: response.text });
+      res.json({ text: response.text, fallback: 'sync' });
     } catch (error: any) {
       console.error('Gemini API Error:', error);
-      
+
       if (error.message && error.message.includes('429') || error.status === 429) {
         // Fallback mock to demonstrate the feature if quota is exceeded
         const mockThought = "> *Analyzing context " + (req.body ? req.body.context : "unknown") + " to determine missing features...*\n> *1. Need to ensure UI provides multiple views.*\n> *2. Need offline persistence.*\n> *3. Need data portability.*\n\n";
-        res.json({ 
-          text: mockThought + "Based on my deep analysis, here are the core features you should implement:\n\n1. **Kanban Board View** for intuitive task management.\n2. **Project Export/Import** to JSON for data portability.\n3. **Analytics Dashboard** to track sprint velocity.\n\nWould you like me to generate the code for any of these?"
+        res.json({
+          text: mockThought + "Based on my deep analysis, here are the core features you should implement:\n\n1. **Kanban Board View** for intuitive task management.\n2. **Project Export/Import** to JSON for data portability.\n3. **Analytics Dashboard** to track sprint velocity.\n\nWould you like me to generate the code for any of these?",
+          fallback: 'sync'
         });
       } else {
         res.status(500).json({ error: error.message || 'An error occurred while communicating with the AI.' });
@@ -105,6 +112,31 @@ User Query: ${message}
 
     }
   });
+
+  // Synchronous single-shot chat — used by FloatingAssistant + 3D compose.
+  // (Same handler as /api/chat but the route name signals "one reply, now".)
+  app.post('/api/chat-sync', async (req, res) => {
+    try {
+      const { message, context } = req.body;
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) return res.status(500).json({ error: 'GEMINI_API_KEY missing' });
+      const ai = new GoogleGenAI({ apiKey });
+      const prompt = `You are a helpful context-aware assistant for the Aura Engine Specification platform. The user is viewing "${context ?? 'unknown'}".\n\nUser query: ${message}`;
+      const response = await ai.models.generateContent({
+        model: 'gemini-3.1-pro-preview',
+        contents: prompt,
+      });
+      res.json({ text: response.text });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message || 'AI error' });
+    }
+  });
+
+  // Dev stubs for the durable-chat polling endpoints. In dev there's no
+  // Workflow, so history is empty and status always reports complete.
+  app.get('/api/chat/status', (req, res) => res.json({ instanceId: String(req.query.instanceId ?? ''), status: 'complete', run: 'complete' }));
+  app.get('/api/chat/history', (req, res) => res.json({ sessionId: String(req.query.sessionId ?? ''), messages: [] }));
+
 
   
   app.post('/api/deep-research', async (req, res) => {
