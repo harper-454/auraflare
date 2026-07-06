@@ -1,0 +1,31 @@
+{
+  "collections": [
+    {
+      "name": "users",
+      "documents": [
+        {
+          "name": "userData",
+          "fields": [
+            { "name": "email", "type": "string" },
+            { "name": "updatedAt", "type": "timestamp" }
+          ],
+          "collections": [
+            {
+              "name": "data",
+              "documents": [
+                {
+                  "name": "appState",
+                  "fields": [
+                    { "name": "key", "type": "string" },
+                    { "name": "value", "type": "string" },
+                    { "name": "updatedAt", "type": "timestamp" }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

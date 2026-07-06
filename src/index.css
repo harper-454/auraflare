@@ -1,0 +1,158 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+@import "tailwindcss";
+
+/* ============================================================
+   Theme: "Quiet Precision"
+   Minimalist professional dark theme — low-glare graphite
+   neutrals, a single muted periwinkle accent, desaturated
+   status colors, Inter + JetBrains Mono.
+   Applied globally by remapping the Tailwind color scales the
+   components already use (slate = neutrals, indigo = accent).
+   ============================================================ */
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  /* Neutrals — deep graphite with a cool tint */
+  --color-slate-950: #0a0c10;
+  --color-slate-900: #10131a;
+  --color-slate-800: #161a22;
+  --color-slate-700: #242a35;
+  --color-slate-600: #3a4250;
+  --color-slate-500: #5c6675;
+  --color-slate-400: #8b94a7;
+  --color-slate-300: #b4bccc;
+  --color-slate-200: #e2e6ee;
+  --color-slate-100: #eef1f6;
+  --color-slate-50: #f7f9fc;
+
+  /* Accent — muted periwinkle */
+  --color-indigo-300: #aab4ff;
+  --color-indigo-400: #93a0ff;
+  --color-indigo-500: #7b8cfa;
+  --color-indigo-600: #6474e8;
+  --color-indigo-700: #5261cf;
+
+  /* Status colors — desaturated so they whisper */
+  --color-emerald-400: #5fc99a;
+  --color-emerald-500: #43b384;
+  --color-teal-400: #55c3bb;
+  --color-teal-500: #3caca4;
+  --color-cyan-400: #5fbedd;
+  --color-cyan-500: #43a8ca;
+  --color-amber-400: #dcb35c;
+  --color-amber-500: #c99d3f;
+  --color-rose-400: #e58398;
+  --color-rose-500: #d5687f;
+  --color-red-400: #e07f7f;
+  --color-red-500: #cf6363;
+  --color-orange-400: #dd9a68;
+  --color-orange-500: #cc824a;
+  --color-green-400: #6cc773;
+  --color-green-500: #4fb158;
+  --color-purple-400: #b394e8;
+  --color-purple-500: #9e79dd;
+  --color-fuchsia-400: #d38ad3;
+  --color-fuchsia-500: #c46ec4;
+}
+
+body {
+  @apply bg-slate-950 text-slate-200 antialiased selection:bg-indigo-500/25;
+  /* Subtle top glow — quiet depth without noise */
+  background-image: radial-gradient(
+    900px 420px at 50% -120px,
+    rgb(123 140 250 / 0.07),
+    transparent 70%
+  );
+  background-attachment: fixed;
+}
+
+/* Tightened heading tracking for a precise, editorial feel */
+h1, h2, h3 {
+  letter-spacing: -0.02em;
+}
+
+/* Refined scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #242a35 transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #242a35;
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: #3a4250;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Soft focus rings */
+:focus-visible {
+  outline: 2px solid rgb(123 140 250 / 0.55);
+  outline-offset: 2px;
+}
+
+.light-theme {
+  /* Inverted neutrals — warm-tinted paper whites */
+  --color-slate-950: #f8f9fc;
+  --color-slate-900: #f1f3f8;
+  --color-slate-800: #e6e9f0;
+  --color-slate-700: #d2d7e0;
+  --color-slate-600: #9aa3b2;
+  --color-slate-500: #6d7688;
+  --color-slate-400: #4d5568;
+  --color-slate-300: #363e50;
+  --color-slate-200: #212836;
+  --color-slate-100: #141a26;
+  --color-slate-50: #0a0c10;
+
+  --color-indigo-400: #5261cf;
+  --color-indigo-500: #4553b8;
+  --color-indigo-600: #3a479f;
+
+  --color-emerald-400: #2c8f66;
+  --color-emerald-500: #237a56;
+
+  --color-teal-400: #298f88;
+  --color-teal-500: #217a74;
+
+  --color-amber-400: #a07a24;
+  --color-amber-500: #8a681d;
+
+  --color-rose-400: #b8475f;
+  --color-rose-500: #a03650;
+
+  --color-cyan-400: #2a83a3;
+  --color-cyan-500: #216f8c;
+
+  --color-orange-400: #b06426;
+  --color-orange-500: #96521d;
+
+  --color-green-400: #35853b;
+  --color-green-500: #2a7030;
+
+  --color-fuchsia-400: #a344a3;
+  --color-fuchsia-500: #8c368c;
+
+  --color-red-400: #b84444;
+  --color-red-500: #a03636;
+
+  --color-purple-400: #7c50c0;
+  --color-purple-500: #6940a8;
+}
+
+.light-theme body,
+body.light-theme {
+  background-image: radial-gradient(
+    900px 420px at 50% -120px,
+    rgb(82 97 207 / 0.06),
+    transparent 70%
+  );
+}

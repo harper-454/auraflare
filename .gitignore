@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+.env.local
+.wrangler/
+.forge-gallery/
+sea-config.json
+AuraFlare.exe
+*.log
+
+# corrupt git backup ( forensic, post-2026-07-05 reconstruction)
+.git-corrupt-*/
+sea-config.json

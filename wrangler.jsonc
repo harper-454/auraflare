@@ -1,0 +1,66 @@
+{
+  // Aura Engine Spec — production deployment on Cloudflare Workers
+  // Deploy: npm run build && npx wrangler deploy
+  // Secrets: npx wrangler secret put GEMINI_API_KEY
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "auraflare",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-06-01",
+
+  // Official home: aura.massivenumber.com (zone already on Cloudflare —
+  // wrangler creates the DNS record and certificate on first deploy)
+  "routes": [
+    { "pattern": "aura.massivenumber.com", "custom_domain": true }
+  ],
+  "workers_dev": true,
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Serve the built SPA via Workers Static Assets
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+
+  // Workers AI — routed through your paid AI Gateway (env.AI.run with gateway id)
+  "ai": {
+    "binding": "AI"
+  },
+
+  // D1: durable spec/task persistence + AI request log (created 2026-07-05)
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "aura-engine-db",
+      "database_id": "8b7ccb9d-4715-4b13-af52-3f80cae4b385"
+    }
+  ],
+
+  // KV: AI response cache + session state (created 2026-07-05)
+  "kv_namespaces": [
+    {
+      "binding": "KV",
+      "id": "8383411ef53445938ead3f2938cd5e3c"
+    }
+  ],
+
+  // R2: media exports (Audio Studio recordings, form exports)
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "aura-engine-assets"
+    }
+  ],
+
+  "vars": {
+    // Your AI Gateway id — "default" is auto-created on first request;
+    // replace with a named gateway to use your configured caching/rate limits/spend limits
+    "AI_GATEWAY_ID": "default",
+    // Workers AI fallback model (open frontier model on Workers AI)
+    "WORKERS_AI_MODEL": "@cf/moonshotai/kimi-k2.6"
+  },
+
+  "observability": {
+    "enabled": true
+  }
+}
