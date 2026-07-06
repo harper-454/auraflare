@@ -1,5 +1,5 @@
 import { useMemo, useState, useEffect } from 'react';
-import { BarChart3, Activity, Gauge, Database } from 'lucide-react';
+import { BarChart3, Activity, Gauge, Database, Bot } from 'lucide-react';
 import {
   ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid,
   PieChart, Pie, Cell, AreaChart, Area,
@@ -10,12 +10,40 @@ import { Task, Requirement } from '../types';
 
 const COLORS = ['#7b8cfa', '#5fc99a', '#dcb35c', '#e58398', '#5fbedd', '#b394e8'];
 
+interface AiStat {
+  endpoint: string;
+  calls: number;
+  avg_ms: number;
+  cache_hits: number;
+}
+
 export function AnalyticsDashboard() {
   // Real data: live from the same storage the Tasks/Requirements sections write to
   const [tasks, setTasks] = useState<Task[]>(() => StorageService.load('aura-app-tasks') ?? projectData.tasks);
   const [requirements] = useState<Requirement[]>(() => StorageService.load('aura-app-requirements-data') ?? projectData.requirements);
   const [fps, setFps] = useState(0);
   const [memory, setMemory] = useState<{ used: number; total: number } | null>(null);
+
+  // Real edge-side AI telemetry from D1 `ai_log` via /api/ai-stats.
+  // This endpoint has existed since 2026-07-05; this is the first UI to read it.
+  const [aiStats, setAiStats] = useState<AiStat[] | null>(null);
+  const [aiStatsError, setAiStatsError] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const res = await fetch('/api/ai-stats');
+        if (!res.ok) throw new Error(String(res.status));
+        const data = await res.json();
+        if (!cancelled) { setAiStats(data.stats ?? []); setAiStatsError(false); }
+      } catch {
+        if (!cancelled) setAiStatsError(true); // local dev server has no D1
+      }
+    };
+    load();
+    const id = setInterval(load, 15000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
 
   // Live refresh when other sections save
   useEffect(() => {
@@ -120,6 +148,52 @@ export function AnalyticsDashboard() {
           </div>
           <div className="text-xs text-slate-500">JS Heap {memory ? `/ ${memory.total.toFixed(0)} MB` : '(Chrome only)'}</div>
         </div>
+      </div>
+
+      {/* Real AI usage from the edge (D1 ai_log) */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl p-6">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-sm font-semibold text-slate-300 flex items-center gap-2">
+            <Bot className="w-4 h-4 text-indigo-400" /> AI Usage — edge telemetry
+          </h3>
+          <span className={`text-[10px] font-mono px-2 py-0.5 rounded-full border ${
+            aiStatsError
+              ? 'text-slate-500 bg-slate-800/60 border-slate-700'
+              : 'text-emerald-400 bg-emerald-400/10 border-emerald-500/20'
+          }`}>
+            {aiStatsError ? 'DEV — no D1 locally' : 'LIVE · D1 ai_log'}
+          </span>
+        </div>
+        {aiStats && aiStats.length > 0 ? (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-[11px] font-mono text-slate-500 uppercase tracking-wider">
+                  <th className="pb-2 pr-4">Endpoint</th>
+                  <th className="pb-2 pr-4">Calls</th>
+                  <th className="pb-2 pr-4">Avg latency</th>
+                  <th className="pb-2">Cache hits</th>
+                </tr>
+              </thead>
+              <tbody className="text-slate-300">
+                {aiStats.map(s => (
+                  <tr key={s.endpoint} className="border-t border-slate-800/60">
+                    <td className="py-2 pr-4 font-mono text-indigo-300">{s.endpoint}</td>
+                    <td className="py-2 pr-4">{s.calls}</td>
+                    <td className="py-2 pr-4">{s.avg_ms >= 1000 ? `${(s.avg_ms / 1000).toFixed(1)} s` : `${Math.round(s.avg_ms)} ms`}</td>
+                    <td className="py-2">{s.cache_hits}<span className="text-slate-600"> / {s.calls}</span></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <p className="text-xs text-slate-500 font-mono">
+            {aiStatsError
+              ? 'AI telemetry lives in production D1 — open aura.massivenumber.com to see real usage.'
+              : 'No AI calls logged yet.'}
+          </p>
+        )}
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">

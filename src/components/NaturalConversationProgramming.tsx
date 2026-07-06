@@ -1,11 +1,13 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
-  Terminal, Send, Command, FolderGit2, Bot, Cpu, Sparkles,
-  Settings2, Network, HardDrive, Trash2, Cloud, CloudOff,
-  Copy, Check, Loader2, CircleDot
+  Terminal, Send, Command, Bot, Sparkles,
+  Settings2, Trash2, Cloud,
+  Copy, Check, Loader2, CircleDot,
+  FileText, Gamepad2, Mic2, Image as ImageIcon, Box, ShieldCheck, Map,
 } from 'lucide-react';
 import Markdown from 'react-markdown';
+import type { SectionId } from '../types';
 
 // Durable chat: the AI runs in a Cloudflare Workflow that survives this
 // browser closing. POST /api/chat returns an instanceId immediately; we poll
@@ -18,35 +20,12 @@ interface ServerMessage {
   content: string;
   instance_id?: string;
   created_at?: string;
+  /** local-only messages (e.g. generated images) are not in D1 history */
+  localOnly?: boolean;
 }
 
 const SESSION_KEY = 'aura-chat-session';
-const SETTINGS_KEY = 'aura-chat-settings';
 const SEEN_KEY = 'aura-chat-seen-id'; // last message id rendered in this session
-
-interface ChatSettings {
-  selectedAgent: string;
-  selectedProvider: string;
-  selectedModel: string;
-  selectedProject: string;
-  memoryEnabled: boolean;
-}
-
-const DEFAULT_SETTINGS: ChatSettings = {
-  selectedAgent: 'architect-v4',
-  selectedProvider: 'google',
-  selectedModel: 'gemini-1.5-pro',
-  selectedProject: 'project-alpha',
-  memoryEnabled: true,
-};
-
-function loadSettings(): ChatSettings {
-  try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
-    if (!raw) return DEFAULT_SETTINGS;
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
-  } catch { return DEFAULT_SETTINGS; }
-}
 
 function extractCode(md: string): { code: string; lang: string } | null {
   const m = md.match(/```([\w-]*)\n([\s\S]*?)```/);
@@ -79,7 +58,55 @@ function CodeMessage({ content }: { content: string }) {
   );
 }
 
-export const NaturalConversationProgramming = () => {
+// ── Capability chips: one tap = a serious, fully-formed creation prompt. ──
+// "If someone can think it, we can create it." Each chip either seeds the
+// composer with an expert prompt or routes to the dedicated surface (3D).
+interface Capability {
+  icon: any;
+  label: string;
+  hint: string;
+  /** prompt seeded into the composer (multi-line prompts encouraged) */
+  prompt?: string;
+  /** or navigate to a dedicated surface */
+  navigate?: SectionId;
+}
+
+const CAPABILITIES: Capability[] = [
+  {
+    icon: FileText, label: 'Research paper', hint: 'structured, citable, thorough',
+    prompt: 'Write a research paper on <topic>. Structure it with an abstract, introduction, methodology, findings, discussion, limitations, and references section. Be rigorous about what is established fact vs. open question.',
+  },
+  {
+    icon: ShieldCheck, label: 'Enterprise app', hint: 'regulatory-grade specs',
+    prompt: 'Design a regulatory-compliant enterprise application for <industry, e.g. healthcare claims processing>. Produce: (1) compliance requirements mapped to the governing regulations, (2) a data-handling and audit-trail architecture, (3) role-based access model, (4) the full technical spec with API surface, and (5) a phased build plan.',
+  },
+  {
+    icon: Gamepad2, label: 'Video game', hint: 'design doc → playable code',
+    prompt: 'Create a video game: <one-line concept>. First produce a tight game design doc (core loop, mechanics, progression, art direction), then implement a playable browser prototype in a single HTML file with canvas rendering and keyboard controls.',
+  },
+  {
+    icon: Mic2, label: 'Podcast', hint: 'script, segments, show notes',
+    prompt: 'Produce a complete podcast episode package on <topic>: a natural two-host script with distinct voices (~15 min), cold-open hook, segment breakdown with timestamps, ad-break placement, and publish-ready show notes with links.',
+  },
+  {
+    icon: Map, label: 'Deep plan', hint: 'spec-grade project planning',
+    prompt: 'Build an extreme-depth execution plan for <project>. Include: vision & MVP cut, complete requirements matrix (functional + non-functional), architecture with tradeoffs considered, risk register with mitigations, week-by-week roadmap, and the definition of done for every milestone.',
+  },
+  {
+    icon: ImageIcon, label: 'Image', hint: 'FLUX on the edge — type /image',
+    prompt: '/image ',
+  },
+  {
+    icon: Box, label: '3D model', hint: 'text → real mesh → .glb',
+    navigate: 'viewport3d',
+  },
+];
+
+interface NcpProps {
+  onNavigate?: (id: SectionId) => void;
+}
+
+export const NaturalConversationProgramming = ({ onNavigate }: NcpProps) => {
   const [sessionId] = useState<string>(() => {
     const existing = localStorage.getItem(SESSION_KEY);
     if (existing) return existing;
@@ -91,23 +118,16 @@ export const NaturalConversationProgramming = () => {
   const [messages, setMessages] = useState<ServerMessage[]>([]);
   const [input, setInput] = useState('');
   const [isOptionsOpen, setIsOptionsOpen] = useState(false);
-  const [settings, setSettings] = useState<ChatSettings>(() => loadSettings());
   const [error, setError] = useState<string | null>(null);
 
   // Per-run tracking. activeRun = the instanceId we're currently polling.
   const [activeRun, setActiveRun] = useState<string | null>(null);
   const [runStatus, setRunStatus] = useState<string>('idle'); // idle | queued | running | paused | complete | errored
+  const [isGeneratingImage, setIsGeneratingImage] = useState(false);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
   const seenIdRef = useRef<string>(localStorage.getItem(SEEN_KEY) || '');
-
-  const updateSetting = <K extends keyof ChatSettings>(k: K, v: ChatSettings[K]) => {
-    setSettings(prev => {
-      const next = { ...prev, [k]: v };
-      try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); } catch { /* ignore */ }
-      return next;
-    });
-  };
 
   // ── Load history on mount (this is what makes "leave and come back" work).
   // Whatever the Workflow produced while you were away is right here.
@@ -135,21 +155,9 @@ export const NaturalConversationProgramming = () => {
     } catch { return []; }
   }, [sessionId]);
 
-  // Initial load + on sessionId change
+  // Initial load
   useEffect(() => {
-    // On a fresh session, show a welcome message. On a returning session,
-    // history will populate from the server.
-    refreshHistory().then((msgs) => {
-      if (msgs.length === 0 && !localStorage.getItem('aura-chat-seen-init')) {
-        localStorage.setItem('aura-chat-seen-init', '1');
-        setMessages([{
-          id: 'sys-init',
-          role: 'system',
-          content: 'Aura Engine initialized. Describe what to build — the AI keeps working even after you close this tab, and your full history is preserved when you return.',
-          created_at: new Date().toISOString(),
-        }]);
-      }
-    });
+    refreshHistory();
   }, [refreshHistory]);
 
   // ── Poll an active run until it finishes (or pauses for input).
@@ -196,11 +204,51 @@ export const NaturalConversationProgramming = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // ── /image <prompt> → real FLUX generation on Workers AI, stored in R2. ──
+  const generateImage = async (prompt: string) => {
+    setIsGeneratingImage(true);
+    const tempId = `img-user-${Date.now()}`;
+    setMessages(prev => [...prev, {
+      id: tempId, role: 'user', content: `/image ${prompt}`,
+      created_at: new Date().toISOString(), localOnly: true,
+    }]);
+    try {
+      const res = await fetch('/api/media/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) {
+        throw new Error(data.error || (res.status === 404
+          ? 'Image generation runs on the production edge (aura.massivenumber.com), not the local dev server.'
+          : `Image generation failed (${res.status})`));
+      }
+      setMessages(prev => [...prev, {
+        id: `img-ai-${Date.now()}`,
+        role: 'ai',
+        content: `![${prompt}](${data.url})\n\n*${prompt}* — generated with FLUX.2 on Workers AI, stored in R2.`,
+        created_at: new Date().toISOString(),
+        localOnly: true,
+      }]);
+    } catch (e: any) {
+      setError(e.message || 'Image generation failed.');
+    } finally {
+      setIsGeneratingImage(false);
+    }
+  };
+
   const handleSend = async () => {
-    if (!input.trim() || activeRun) return; // don't queue two runs at once
+    if (!input.trim() || activeRun || isGeneratingImage) return; // don't queue two runs at once
     const userText = input.trim();
     setInput('');
     setError(null);
+
+    // Slash command: /image <prompt>
+    if (userText.toLowerCase().startsWith('/image ')) {
+      await generateImage(userText.slice(7).trim());
+      return;
+    }
 
     // Optimistic: show the user's message immediately.
     const tempId = `pending-${Date.now()}`;
@@ -211,16 +259,7 @@ export const NaturalConversationProgramming = () => {
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: userText,
-          context: 'chat',
-          sessionId,
-          model: settings.selectedModel,
-          agent: settings.selectedAgent,
-          provider: settings.selectedProvider,
-          project: settings.selectedProject,
-          memory: settings.memoryEnabled,
-        }),
+        body: JSON.stringify({ message: userText, context: 'chat', sessionId }),
       });
       const data = await res.json();
 
@@ -255,130 +294,219 @@ export const NaturalConversationProgramming = () => {
     }
   };
 
+  const applyCapability = (cap: Capability) => {
+    if (cap.navigate) {
+      onNavigate?.(cap.navigate);
+      return;
+    }
+    if (cap.prompt) {
+      setInput(cap.prompt);
+      requestAnimationFrame(() => {
+        inputRef.current?.focus();
+        // put the caret at the first <placeholder> for instant editing
+        const idx = cap.prompt!.indexOf('<');
+        if (idx >= 0) inputRef.current?.setSelectionRange(idx, cap.prompt!.indexOf('>') + 1);
+      });
+    }
+  };
+
   const clearChat = async () => {
     if (!confirm('Start a fresh conversation? This clears the local view. The cloud history remains until you clear it from the dashboard.')) return;
     localStorage.removeItem(SESSION_KEY);
     localStorage.removeItem(SEEN_KEY);
-    localStorage.removeItem('aura-chat-seen-init');
     seenIdRef.current = '';
     setActiveRun(null);
     setRunStatus('idle');
-    setMessages([{
-      id: 'sys-init',
-      role: 'system',
-      content: 'New conversation started. Ready when you are.',
-      created_at: new Date().toISOString(),
-    }]);
+    setMessages([]);
     // reload to pick up a fresh sessionId
     setTimeout(() => window.location.reload(), 100);
   };
 
-  const busy = activeRun !== null;
+  const busy = activeRun !== null || isGeneratingImage;
   const statusLabel: Record<string, string> = {
     idle: '', queued: 'Queued…', running: 'Working…', paused: 'Needs input', complete: 'Done', errored: 'Error',
   };
+  const isEmpty = messages.length === 0;
 
   return (
-    <div className="flex flex-col h-full bg-[#0a0f1c] border-l border-slate-800 relative">
+    <div className="flex flex-col h-full bg-[#0a0f1c] relative">
       {/* Header */}
-      <div className="h-14 border-b border-slate-800 flex items-center justify-between px-6 bg-slate-900/50 backdrop-blur z-10 sticky top-0">
-        <h2 className="text-lg font-bold text-white flex items-center gap-3">
-          <Terminal className="text-indigo-400" /> Natural Conversation Programming
+      <div className="h-14 border-b border-slate-800/60 flex items-center justify-between px-6 bg-slate-900/40 backdrop-blur z-10 sticky top-0">
+        <h2 className="text-[15px] font-semibold text-slate-100 flex items-center gap-2.5">
+          <Terminal className="w-4 h-4 text-indigo-400" /> Create
+          <span className="hidden md:inline text-[11px] font-normal text-slate-500">— natural conversation programming</span>
         </h2>
-        <div className="flex items-center gap-3">
+        <div className="flex items-center gap-2">
           {busy && (
             <span className="flex items-center gap-1.5 text-xs font-mono px-3 py-1 rounded-full border bg-indigo-500/10 border-indigo-500/30 text-indigo-300">
               <Loader2 className="w-3 h-3 animate-spin" />
-              {statusLabel[runStatus] || 'Working…'}
+              {isGeneratingImage ? 'Painting…' : statusLabel[runStatus] || 'Working…'}
             </span>
           )}
-          <span className="flex items-center gap-1.5 text-xs font-mono px-3 py-1 rounded-full border bg-emerald-400/10 border-emerald-500/20 text-emerald-400">
+          <span className="flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-1 rounded-full border bg-emerald-400/10 border-emerald-500/20 text-emerald-400" title="The AI runs in a durable Cloudflare Workflow — it keeps working after you close the tab.">
             <Cloud className="w-3 h-3" /> DURABLE
           </span>
           <button
             onClick={clearChat}
             title="Start fresh"
-            className="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-rose-300 transition-colors"
+            className="p-2 hover:bg-slate-800 rounded-lg text-slate-500 hover:text-rose-300 transition-colors"
           >
             <Trash2 className="w-4 h-4" />
           </button>
           <button
             onClick={() => setIsOptionsOpen(!isOptionsOpen)}
-            className={`p-2 rounded-lg transition-colors ${isOptionsOpen ? 'bg-slate-800 text-white' : 'hover:bg-slate-800 text-slate-400 hover:text-white'}`}
+            title="Runtime details"
+            className={`p-2 rounded-lg transition-colors ${isOptionsOpen ? 'bg-slate-800 text-white' : 'hover:bg-slate-800 text-slate-500 hover:text-white'}`}
           >
-            <Settings2 className="w-5 h-5" />
+            <Settings2 className="w-4 h-4" />
           </button>
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-6 md:p-10 space-y-8">
-        <AnimatePresence>
-          {messages.map((msg) => (
-            <motion.div
-              key={msg.id}
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              className={`flex gap-4 max-w-4xl ${msg.role === 'user' ? 'ml-auto flex-row-reverse' : ''}`}
-            >
-              <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border ${
-                msg.role === 'user'
-                  ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-400'
-                  : msg.role === 'system'
-                  ? 'bg-amber-500/20 border-amber-500/50 text-amber-400'
-                  : 'bg-emerald-500/20 border-emerald-500/50 text-emerald-400'
-              }`}>
-                {msg.role === 'user' ? <Terminal className="w-4 h-4" /> :
-                 msg.role === 'system' ? <Command className="w-4 h-4" /> :
-                 <Bot className="w-4 h-4" />}
+      {/* Honest runtime panel (replaces the old decorative provider/model pickers) */}
+      <AnimatePresence>
+        {isOptionsOpen && (
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            className="overflow-hidden border-b border-slate-800/60 bg-slate-900/40"
+          >
+            <div className="px-6 py-4 grid grid-cols-2 md:grid-cols-4 gap-4 text-xs font-mono">
+              <div>
+                <div className="text-slate-600 uppercase tracking-wider text-[10px] mb-1">Model</div>
+                <div className="text-slate-300">kimi-k2.6 · Workers AI</div>
               </div>
-              <div className={`flex flex-col gap-1 ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
-                <div className="flex items-center gap-2 text-xs font-mono text-slate-500">
-                  <span className="font-bold uppercase tracking-wider text-slate-400">
-                    {msg.role === 'user' ? 'You' : msg.role === 'system' ? 'System' : 'Aura'}
-                  </span>
-                  {msg.instance_id && msg.role === 'ai' && (
-                    <span className="flex items-center gap-0.5 text-[9px] text-emerald-600">
-                      <CircleDot className="w-2.5 h-2.5" /> durable
+              <div>
+                <div className="text-slate-600 uppercase tracking-wider text-[10px] mb-1">Execution</div>
+                <div className="text-slate-300">Durable Workflow · ≤6 turns</div>
+              </div>
+              <div>
+                <div className="text-slate-600 uppercase tracking-wider text-[10px] mb-1">Memory</div>
+                <div className="text-slate-300">D1 · full thread persisted</div>
+              </div>
+              <div>
+                <div className="text-slate-600 uppercase tracking-wider text-[10px] mb-1">Images</div>
+                <div className="text-slate-300">/image → FLUX.2 → R2</div>
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <div className="flex-1 overflow-y-auto">
+        {/* Hero empty state — the first impression */}
+        {isEmpty && (
+          <div className="h-full flex flex-col items-center justify-center px-6 pb-24">
+            <motion.div
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="text-center max-w-2xl"
+            >
+              <h1 className="text-3xl md:text-4xl font-bold tracking-tight bg-gradient-to-r from-slate-100 via-indigo-200 to-slate-300 bg-clip-text text-transparent">
+                What should we build?
+              </h1>
+              <p className="mt-3 text-sm text-slate-500">
+                Describe it in plain language. The AI keeps working even if you close the tab —
+                your conversation is preserved exactly as you left it.
+              </p>
+            </motion.div>
+            <motion.div
+              initial={{ opacity: 0, y: 16 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.08 }}
+              className="mt-8 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-2 w-full max-w-4xl"
+            >
+              {CAPABILITIES.map(cap => {
+                const Icon = cap.icon;
+                return (
+                  <button
+                    key={cap.label}
+                    onClick={() => applyCapability(cap)}
+                    className="group flex flex-col items-start gap-1.5 p-3 rounded-xl bg-slate-900/60 border border-slate-800/80 hover:border-indigo-500/40 hover:bg-slate-900 transition-all text-left"
+                  >
+                    <Icon className="w-4 h-4 text-slate-500 group-hover:text-indigo-400 transition-colors" />
+                    <span className="text-[12px] font-medium text-slate-300">{cap.label}</span>
+                    <span className="text-[10px] leading-tight text-slate-600">{cap.hint}</span>
+                  </button>
+                );
+              })}
+            </motion.div>
+          </div>
+        )}
+
+        {/* Conversation */}
+        {!isEmpty && (
+          <div className="p-6 md:p-10 space-y-8">
+            <AnimatePresence>
+              {messages.map((msg) => (
+                <motion.div
+                  key={msg.id}
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className={`flex gap-4 max-w-4xl ${msg.role === 'user' ? 'ml-auto flex-row-reverse' : ''}`}
+                >
+                  <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border ${
+                    msg.role === 'user'
+                      ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-400'
+                      : msg.role === 'system'
+                      ? 'bg-amber-500/20 border-amber-500/50 text-amber-400'
+                      : 'bg-emerald-500/20 border-emerald-500/50 text-emerald-400'
+                  }`}>
+                    {msg.role === 'user' ? <Terminal className="w-4 h-4" /> :
+                     msg.role === 'system' ? <Command className="w-4 h-4" /> :
+                     <Bot className="w-4 h-4" />}
+                  </div>
+                  <div className={`flex flex-col gap-1 ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
+                    <div className="flex items-center gap-2 text-xs font-mono text-slate-500">
+                      <span className="font-bold uppercase tracking-wider text-slate-400">
+                        {msg.role === 'user' ? 'You' : msg.role === 'system' ? 'System' : 'Aura'}
+                      </span>
+                      {msg.instance_id && msg.role === 'ai' && (
+                        <span className="flex items-center gap-0.5 text-[9px] text-emerald-600">
+                          <CircleDot className="w-2.5 h-2.5" /> durable
+                        </span>
+                      )}
+                    </div>
+                    <div className={`p-4 rounded-xl border ${
+                      msg.role === 'user'
+                        ? 'bg-indigo-600/10 border-indigo-500/20 text-indigo-100 rounded-tr-sm'
+                        : msg.role === 'system'
+                        ? 'bg-amber-500/5 border-amber-500/20 text-amber-200/80 font-mono text-sm rounded-tl-sm'
+                        : 'bg-slate-900 border-slate-800 text-slate-300 rounded-tl-sm'
+                    }`}>
+                      {msg.role === 'ai'
+                        ? <CodeMessage content={msg.content} />
+                        : <div className="text-sm leading-relaxed max-w-prose whitespace-pre-wrap">{msg.content}</div>}
+                    </div>
+                  </div>
+                </motion.div>
+              ))}
+              {busy && (
+                <motion.div
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  className="flex gap-4 max-w-4xl"
+                >
+                  <div className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border bg-emerald-500/20 border-emerald-500/50 text-emerald-400">
+                    <Bot className="w-4 h-4 animate-pulse" />
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <div className="flex gap-1">
+                      <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-bounce"></div>
+                      <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
+                      <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
+                    </div>
+                    <span className="text-xs font-mono text-emerald-500/70">
+                      {isGeneratingImage ? 'Generating image…' : runStatus === 'queued' ? 'Queued…' : 'Working — safe to close this tab'}
                     </span>
-                  )}
-                </div>
-                <div className={`p-4 rounded-xl border ${
-                  msg.role === 'user'
-                    ? 'bg-indigo-600/10 border-indigo-500/20 text-indigo-100 rounded-tr-sm'
-                    : msg.role === 'system'
-                    ? 'bg-amber-500/5 border-amber-500/20 text-amber-200/80 font-mono text-sm rounded-tl-sm'
-                    : 'bg-slate-900 border-slate-800 text-slate-300 rounded-tl-sm'
-                }`}>
-                  {msg.role === 'ai'
-                    ? <CodeMessage content={msg.content} />
-                    : <div className="text-sm leading-relaxed max-w-prose whitespace-pre-wrap">{msg.content}</div>}
-                </div>
-              </div>
-            </motion.div>
-          ))}
-          {busy && (
-            <motion.div
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="flex gap-4 max-w-4xl"
-            >
-              <div className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border bg-emerald-500/20 border-emerald-500/50 text-emerald-400">
-                <Bot className="w-4 h-4 animate-pulse" />
-              </div>
-              <div className="flex items-center gap-2">
-                <div className="flex gap-1">
-                  <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-bounce"></div>
-                  <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-bounce" style={{ animationDelay: '0.1s' }}></div>
-                  <div className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-bounce" style={{ animationDelay: '0.2s' }}></div>
-                </div>
-                <span className="text-xs font-mono text-emerald-500/70">
-                  {runStatus === 'queued' ? 'Queued…' : 'Working — safe to close this tab'}
-                </span>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
-        <div ref={messagesEndRef} />
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+            <div ref={messagesEndRef} />
+          </div>
+        )}
       </div>
 
       {error && (
@@ -388,89 +516,28 @@ export const NaturalConversationProgramming = () => {
         </div>
       )}
 
-      <div className="p-6 bg-slate-950 border-t border-slate-800 relative z-20">
-        <AnimatePresence>
-          {isOptionsOpen && (
-            <motion.div
-              initial={{ opacity: 0, height: 0, marginBottom: 0 }}
-              animate={{ opacity: 1, height: 'auto', marginBottom: 24 }}
-              exit={{ opacity: 0, height: 0, marginBottom: 0 }}
-              className="overflow-hidden"
-            >
-              <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 grid grid-cols-2 lg:grid-cols-5 gap-4">
-                <div>
-                  <label className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1"><FolderGit2 className="w-3 h-3" /> Project</label>
-                  <select
-                    value={settings.selectedProject}
-                    onChange={(e) => updateSetting('selectedProject', e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-300 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none"
-                  >
-                    <option value="project-alpha">Global Context</option>
-                    <option value="frontend-workspace">Frontend Workspace</option>
-                    <option value="backend-services">Backend Services</option>
-                    <option value="infrastructure">Infrastructure</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1"><Network className="w-3 h-3" /> Provider</label>
-                  <select
-                    value={settings.selectedProvider}
-                    onChange={(e) => updateSetting('selectedProvider', e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-300 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none"
-                  >
-                    <option value="google">Google GenAI</option>
-                    <option value="anthropic">Anthropic</option>
-                    <option value="openai">OpenAI</option>
-                    <option value="meta">Meta Llama</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1"><Cpu className="w-3 h-3" /> Model</label>
-                  <select
-                    value={settings.selectedModel}
-                    onChange={(e) => updateSetting('selectedModel', e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-300 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none"
-                  >
-                    {settings.selectedProvider === 'google' && (
-                      <>
-                        <option value="gemini-1.5-pro">Gemini 1.5 Pro</option>
-                        <option value="gemini-1.5-flash">Gemini 1.5 Flash</option>
-                      </>
-                    )}
-                    {settings.selectedProvider !== 'google' && (
-                      <option value="default-model">Default Model</option>
-                    )}
-                  </select>
-                </div>
-                <div>
-                  <label className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1"><Bot className="w-3 h-3" /> Agent</label>
-                  <select
-                    value={settings.selectedAgent}
-                    onChange={(e) => updateSetting('selectedAgent', e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-300 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none"
-                  >
-                    <option value="architect-v4">Architect v4</option>
-                    <option value="debugger-pro">Debugger Pro</option>
-                    <option value="ux-researcher">UX Researcher</option>
-                  </select>
-                </div>
-                <div className="flex flex-col justify-end">
-                  <label className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1"><HardDrive className="w-3 h-3" /> Memory</label>
-                  <button
-                    onClick={() => updateSetting('memoryEnabled', !settings.memoryEnabled)}
-                    className={`w-full py-2 px-3 rounded-lg text-sm font-bold border transition-colors flex items-center justify-center gap-2 ${settings.memoryEnabled ? 'bg-indigo-500/20 border-indigo-500/50 text-indigo-300' : 'bg-slate-800 border-slate-700 text-slate-500'}`}
-                  >
-                    <div className={`w-2 h-2 rounded-full ${settings.memoryEnabled ? 'bg-indigo-400 animate-pulse' : 'bg-slate-500'}`}></div>
-                    {settings.memoryEnabled ? 'RECORDING' : 'PAUSED'}
-                  </button>
-                </div>
-              </div>
-            </motion.div>
-          )}
-        </AnimatePresence>
+      <div className="px-6 pb-6 pt-2 bg-transparent relative z-20">
+        {/* Compact capability strip once a conversation exists */}
+        {!isEmpty && !busy && (
+          <div className="flex gap-1.5 mb-2 overflow-x-auto pb-1">
+            {CAPABILITIES.map(cap => {
+              const Icon = cap.icon;
+              return (
+                <button
+                  key={cap.label}
+                  onClick={() => applyCapability(cap)}
+                  className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-900/70 border border-slate-800 hover:border-indigo-500/40 text-[11px] text-slate-400 hover:text-slate-200 whitespace-nowrap transition-colors"
+                >
+                  <Icon className="w-3 h-3" /> {cap.label}
+                </button>
+              );
+            })}
+          </div>
+        )}
 
         <div className="relative">
           <textarea
+            ref={inputRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
@@ -479,27 +546,24 @@ export const NaturalConversationProgramming = () => {
                 handleSend();
               }
             }}
-            placeholder={busy ? 'Aura is working — safe to close the tab…' : 'Describe what to build. The AI keeps working after you leave…'}
+            placeholder={busy ? 'Aura is working — safe to close the tab…' : 'Describe anything. Research, apps, games, images (/image), specs…'}
             disabled={busy}
-            className="w-full bg-slate-900 border border-slate-800 rounded-xl pl-4 pr-16 py-4 text-slate-200 placeholder:text-slate-600 focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none resize-none overflow-hidden disabled:opacity-60"
+            className="w-full bg-slate-900 border border-slate-800 rounded-2xl pl-5 pr-16 py-4 text-slate-200 placeholder:text-slate-600 focus:border-indigo-500/60 focus:ring-1 focus:ring-indigo-500/40 outline-none resize-none overflow-hidden disabled:opacity-60 shadow-lg shadow-black/20"
             rows={1}
-            style={{ minHeight: '60px', maxHeight: '200px' }}
+            style={{ minHeight: '60px', maxHeight: '220px' }}
           />
           <button
             onClick={handleSend}
             disabled={!input.trim() || busy}
-            className="absolute right-2 top-2 p-3 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-600 text-white rounded-lg transition-colors flex items-center justify-center"
+            className="absolute right-2.5 top-2.5 p-3 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-600 text-white rounded-xl transition-colors flex items-center justify-center"
           >
             {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
           </button>
         </div>
-        <div className="mt-3 flex items-center justify-between text-xs text-slate-500 font-mono">
+        <div className="mt-2.5 flex items-center justify-between text-[11px] text-slate-600 font-mono">
           <div className="flex gap-4 items-center flex-wrap">
-            <span className="flex items-center gap-1"><Command className="w-3 h-3" /> + Enter to send</span>
-            <span className="flex items-center gap-1"><Sparkles className="w-3 h-3 text-indigo-400" /> Durable workflow</span>
-            <span className="flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-              <Cloud className="w-3 h-3" /> Survives tab close
-            </span>
+            <span className="flex items-center gap-1"><Command className="w-3 h-3" /> Enter to send · Shift+Enter for a new line</span>
+            <span className="flex items-center gap-1"><Sparkles className="w-3 h-3 text-indigo-400/70" /> Durable — survives tab close</span>
           </div>
           <span>≈{Math.round(input.length * 0.25)} tokens</span>
         </div>

@@ -39,13 +39,14 @@ Everything in the sidebar either feeds those two, tells the truth about the infr
 
 The corrected Tier 1 from RESEARCH.md, in dependency order. All data/infra already exists; this is plumbing and label-truth.
 
-1. **Wire `/api/ai-stats` into Analytics** (replace localStorage-only reads) + Workflow status donut.
-2. **Wire `/api/spec` into `useAutoSave`** (debounced D1 fan-out after localStorage write) — cloud-persists 5 spec sections in one change.
-3. **Honesty pass:** cut Fleet Health MDM; merge WebGL Engine into 3D Viewport; cut hallucinated Architecture cards; rename NPU→Neural Inference, Satellite→Orbital Tracking, Swarm→System Telemetry; make IaC read real `wrangler.jsonc`.
-4. **Workers AI image gen** `POST /api/media/generate` (FLUX.2 klein → R2) — highest-ROI single endpoint; free under the current plan.
+1. ✅ **Wire `/api/ai-stats` into Analytics** — done 2026-07-06 (AI Usage table, 15 s poll). Workflow status donut still open.
+2. ✅ **Wire `/api/spec` into `useAutoSave`** — done 2026-07-06 (debounced D1 fan-out, fire-and-forget).
+3. ✅ (mostly) **Honesty pass** — done 2026-07-06: Fleet Health cut, WebGL Engine cut, renames landed in the section registry, minimal Create/Build/Operate/Labs shell shipped. Still open: component-internal copy for the renamed four; Architecture cards; IaC reading real `wrangler.jsonc`.
+4. ✅ **Workers AI image gen** — done 2026-07-06: `POST /api/media/generate` + `/image` command in the chat. Verify against the live model after deploy.
 5. **`isomorphic-git` + server-side `cdn-cgi/trace`** — kill the two `/api/exec` 501 paths that break in prod.
 6. **`.github/workflows/deploy.yml`** (wrangler-action) — push-to-deploy, removes the manual deploy dependency that blocked Phase 0.3 today.
 7. **Server-side passkey verification** (`@simplewebauthn/server`) — delete the forgeable localStorage WebAuthn.
+8. ✅ **NCP as the flagship surface** — done 2026-07-06: hero empty state, 7 capability chips (research paper / enterprise-regulatory app / game / podcast / deep plan / image / 3D), honest runtime panel, upgraded creation-engine system prompt.
 
 **Exit criteria:** no fictional content anywhere in the UI; every dashboard shows real data; deploys happen on push.
 

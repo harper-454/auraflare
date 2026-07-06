@@ -85,10 +85,10 @@ export function SettingsPanel() {
               {tab === 'features' && (
                 <div className="space-y-5 overflow-y-auto pr-1" style={{ maxHeight: 'calc(100vh - 16rem)' }}>
                   <p className="text-xs text-slate-500">
-                    Show or hide sections from the sidebar. Primary and Account sections are always visible.
+                    Show or hide sections from the sidebar. Create and Account sections are always visible.
                   </p>
                   {GROUP_ORDER
-                    .filter(g => g !== 'primary' && g !== 'admin')
+                    .filter(g => g !== 'create' && g !== 'admin')
                     .map(group => {
                       const items = SECTIONS.filter(s => s.group === group);
                       if (items.length === 0) return null;

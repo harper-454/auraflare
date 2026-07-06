@@ -19,6 +19,26 @@ The **MVP** is the **NCP Chat** (`src/components/NaturalConversationProgramming.
 
 ---
 
+## What changed in the 2026-07-06 "minimal surface" pass (Claude, same day, after the audit)
+
+Product direction from the owner: *"the most beautiful simplistic look with all the power hidden underneath — natural conversation programming that dominates. If someone can think it, we can create it."* This pass executed the UI half plus the free backend wins; a Claude Code session picks up from here.
+
+**Shell** — the default sidebar is now just **Create** (Create/3D Studio/Media Studio/Deep Research) + **Build** (IDE + spec sections) + **Account**. The Operate and Labs groups (11 + 13 real sections) are hidden by default, one toggle away in Settings → Features; a "N more tools in Settings" affordance sits at the bottom of the sidebar. `aura-sidebar-hidden-v` version key resets returning users to the new minimal default. **Cut for good:** `fleet-health` (fictional MDM) and `3d-engine` (redundant WebGL demo) — section entries + routes removed; component files left on disk, unrouted. **Renamed honestly:** NPU→Neural Inference, Satellite Uplink→Orbital Tracking, Agent Swarm→System Telemetry, P2P WASM→WASM Workers. (Component-internal copy for those four still says the old names — small follow-up.)
+
+**NCP chat ("Create")** — hero empty state ("What should we build?") with 7 capability chips that seed expert-grade prompts: research paper, enterprise/regulatory app, video game, podcast, deep plan, image, 3D model (routes to the 3D Studio via a new optional `onNavigate` prop). Compact chip strip persists above the composer in ongoing conversations. The decorative provider/model/agent selectors are **gone** (they controlled nothing); replaced by an honest runtime panel (kimi-k2.6 · Durable Workflow · D1 · /image→FLUX). New **`/image <prompt>` slash command** calls the new image-gen endpoint and renders the result inline (local-only message; not persisted to D1 history yet — follow-up).
+
+**Worker** — new `POST /api/media/generate`: FLUX.2 [klein] on Workers AI → R2 (`gen/<ts>-<slug>.png`), returns `{key, url}`; handles both stream and base64 response shapes; logs to `ai_log`. The chat SYSTEM_PROMPT was rewritten around the "complete professional artifacts" promise (research/regulatory/games/podcasts/plans). **Untested against the live model — verify after next deploy** (the model string `@cf/black-forest-labs/flux-2-klein-4b` and its response shape come from RESEARCH.md's citations).
+
+**Free wins wired** — `useAutoSave` now mirrors every autosaved key to D1 via debounced `PUT /api/spec` (fire-and-forget; localStorage stays authoritative). `AnalyticsDashboard` gained a real "AI Usage — edge telemetry" table reading `/api/ai-stats` (first UI ever to read it), polling every 15 s, honest DEV badge locally.
+
+**Migrations** — `0002_spec_ai_log_and_users.sql` captures the live `spec_data`/`ai_log` schemas + widens `ai_log` (tokens_in/out, cost_usd, status) + adds `user_id` to chat tables + an endpoint/time index. **Already applied to production D1** (via API, 2026-07-06) — the file exists so fresh environments reproduce; `wrangler d1 migrations apply` on prod would re-run ALTERs and fail, so mark 0002 as applied if you adopt wrangler's migration tracking.
+
+Verified: `tsc --noEmit` and `tsc -p tsconfig.worker.json` both clean. **Not yet deployed** — needs `Deploy.cmd` / `npm run deploy:cf` on the owner's machine (includes the earlier 3D fixes too).
+
+**Suggested next steps for Claude Code:** deploy + verify /image and GPU-path 3D in a browser; persist generated images into chat history (D1); component-internal copy for the four renamed sections; then MASTERPLAN Phase 2 (AI inline-edit is the queued differentiator).
+
+---
+
 ## What changed in the 2026-07-06 audit pass (Claude)
 
 A full verification sweep of every claim from the prior sessions, against the code, the production D1, and the live site. Outcome: the architecture claims held (durable chat verified live end-to-end; prod bundle matches local), but **three real 3D engine bugs** were found and fixed in `src/lib/`:

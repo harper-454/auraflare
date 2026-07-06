@@ -113,7 +113,13 @@ async function logAi(env: Env, endpoint: string, model: string, cached: boolean,
 // history at any time.
 // ───────────────────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are Aura, the AI engineering partner in the AuraFlare platform. You help users design systems, write code, and reason about architecture. Be concrete and practical. When you produce code, use fenced code blocks with the language tag. You are running in a durable workflow — you can take multiple turns to fully address a request.`;
+const SYSTEM_PROMPT = `You are Aura, the creation engine inside AuraFlare. The promise of this product: if someone can think it, you can create it. You produce complete, professional-grade artifacts, not sketches:
+- Software: full working code in fenced blocks with language tags; single-file browser prototypes when asked for games or interactive apps.
+- Research papers: rigorous structure (abstract → methodology → findings → limitations); clearly separate established fact from open questions; never fabricate citations.
+- Enterprise/regulatory apps: map requirements to the actual governing regulations, specify audit trails, data handling, and access models before code.
+- Plans and specs: exhaustive, decision-ready — requirements matrices, risk registers, phased roadmaps with definitions of done.
+- Podcasts/scripts/creative: publish-ready, with structure (segments, timestamps, show notes) not just prose.
+Be concrete and practical; state assumptions instead of asking trivial questions. You run in a durable workflow — you may take multiple turns to fully finish something ambitious, and the user may close their browser while you work. Use your turns to deliver the complete artifact.`;
 
 const MAX_TURNS = 6;
 
@@ -371,6 +377,38 @@ export default {
         'SELECT endpoint, COUNT(*) as calls, AVG(latency_ms) as avg_ms, SUM(cached) as cache_hits FROM ai_log GROUP BY endpoint ORDER BY calls DESC',
       ).all();
       return json({ stats: results });
+    }
+
+    // ── Real image generation: FLUX.2 [klein] on Workers AI → R2 ──
+    // Free under the Workers AI allocation; returns a binary PNG stream
+    // (image models do NOT use the {response} JSON envelope).
+    if (pathname === '/api/media/generate' && request.method === 'POST') {
+      const { prompt } = await request.json<{ prompt?: string }>().catch(() => ({} as { prompt?: string }));
+      if (!prompt || !prompt.trim()) return json({ error: 'prompt required' }, 400);
+      const started = Date.now();
+      try {
+        const img: any = await env.AI.run(
+          '@cf/black-forest-labs/flux-2-klein-4b' as Parameters<Ai['run']>[0],
+          { prompt: prompt.slice(0, 2048) } as never,
+          { gateway: { id: env.AI_GATEWAY_ID, metadata: { endpoint: 'image-gen' } } } as never,
+        );
+        let body: ReadableStream | ArrayBuffer | null = null;
+        if (img instanceof ReadableStream) {
+          body = img;
+        } else if (img && typeof img.image === 'string') {
+          // some image models return { image: <base64> }
+          const bin = Uint8Array.from(atob(img.image), c => c.charCodeAt(0));
+          body = bin.buffer as ArrayBuffer;
+        }
+        if (!body) return json({ error: 'unexpected image model response shape' }, 502);
+        const slug = prompt.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'image';
+        const key = `gen/${Date.now()}-${slug}.png`;
+        await env.BUCKET.put(key, body as any, { httpMetadata: { contentType: 'image/png' } });
+        ctx.waitUntil(logAi(env, 'image-gen', 'flux-2-klein-4b', false, Date.now() - started));
+        return json({ ok: true, key, url: `/api/media/${encodeURIComponent(key)}` });
+      } catch (e: any) {
+        return json({ error: e.message }, 502);
+      }
     }
 
     // ── R2 media gallery ──

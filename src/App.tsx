@@ -22,7 +22,6 @@ import { NaturalConversationProgramming } from './components/NaturalConversation
 import { AutomatedWorkflows } from './components/AutomatedWorkflows';
 import { DocsAndSupport } from './components/DocsAndSupport';
 import { AccountManagement } from './components/AccountManagement';
-import { FleetHealthDashboard } from './components/FleetHealthDashboard';
 import { BillingSection } from './components/BillingSection';
 import { SuperpositionDebuggingSection } from './components/SuperpositionDebuggingSection';
 import { NeuromorphicHardwareSection } from './components/NeuromorphicHardwareSection';
@@ -33,7 +32,6 @@ import { Breadcrumb } from './components/Breadcrumb';
 import { FloatingAssistant } from './components/FloatingAssistant';
 import { SettingsPanel } from './components/SettingsPanel';
 import { VoipNode } from './components/VoipNode';
-import { WebGLEngine } from './components/WebGLEngine';
 import { MediaStudio } from './components/MediaStudio';
 import { DynamicForms } from './components/DynamicForms';
 import { AnalyticsDashboard } from './components/AnalyticsDashboard';
@@ -94,11 +92,10 @@ export default function App() {
       case 'webgpu':
         return <WebGPUComputeSection />;
 
-      case 'chat': return <NaturalConversationProgramming />;
+      case 'chat': return <NaturalConversationProgramming onNavigate={setCurrentSection} />;
       case 'workflows': return <AutomatedWorkflows />;
       case 'docs': return <DocsAndSupport />;
       case 'account': return <AccountManagement />;
-      case 'fleet-health': return <FleetHealthDashboard />;
 
       case 'deep-research': return <DeepResearchSection />;
       case 'multi-agent-builder': return <MultiAgentBuilderSection />;
@@ -112,7 +109,6 @@ export default function App() {
 
       case 'ide': return <IdeWorkspaceSection />;
       case 'voip': return <VoipNode />;
-      case '3d-engine': return <WebGLEngine />;
       case 'media-studio': return <MediaStudio />;
       case 'dynamic-forms': return <DynamicForms />;
       case 'analytics': return <AnalyticsDashboard />;
