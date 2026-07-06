@@ -123,21 +123,22 @@ function primDist(op: CompiledOp, px: number, py: number, pz: number): number {
       return k1 > 1e-9 ? (k0 * (k0 - 1)) / k1 : -Math.min(s[0], s[1], s[2]);
     }
     case 'cone': {
-      // IQ exact cone SDF: circular base of radius r on XZ plane, height h to apex along +Y.
+      // IQ exact cone SDF: circular base of radius r on the XZ plane (y=0),
+      // apex at (0,h,0). Faithful port of iquilezles.org sdCone — the previous
+      // hand-rolled variant used a dot product in the sign term where IQ uses
+      // a 2D cross product, which flipped the sign in a far-field wedge and
+      // produced phantom geometry (caught by the 2026-07-06 audit).
       const r = op.r ?? 0.3;
       const h = op.h ?? 0.6;
-      const q = Math.sqrt(x * x + z * z);  // radial distance
-      // tip at (0,h), base corners at (±r, 0) in the (radial, y) plane
-      const w = vec2Make(r, h);
-      const v = vec2Make(r, -h);
-      const pq = vec2Make(q, y);
-      const a = vec2Sub(pq, vec2Mul(v, clamp(vec2Dot(vec2Sub(pq, w), v) / vec2Dot(v, v), 0, 1)));
-      const b = vec2Sub(pq, vec2Mul(w, clamp(vec2Dot(vec2Sub(pq, v), w) / vec2Dot(w, w), 0, 1)));
-      const da = vec2Dot(a, a);
-      const db = vec2Dot(b, b);
-      const dd = Math.min(da, db);
-      const s = Math.max(vec2Dot(pq, v) * (q > r ? 1 : -1), y < h ? -1 : 1);
-      return Math.sign(s) * Math.sqrt(dd);
+      const wx = Math.sqrt(x * x + z * z);
+      const wy = y - h;                    // IQ space: tip at origin, base at y=-h
+      const qx = r, qy = -h;
+      const t = clamp((wx * qx + wy * qy) / (qx * qx + qy * qy), 0, 1);
+      const ax = wx - qx * t, ay = wy - qy * t;          // closest point on slant
+      const bx = wx - qx * clamp(wx / qx, 0, 1), by = wy - qy; // closest point on base
+      const dd = Math.min(ax * ax + ay * ay, bx * bx + by * by);
+      const s = Math.max(-(wx * qy - wy * qx), -(wy - qy)); // k = sign(qy) = -1
+      return Math.sqrt(dd) * Math.sign(s);
     }
     case 'hex': {
       // IQ hexagonal prism, extruded along Y. size[0]=radial, size[1]=half-height.
@@ -164,12 +165,6 @@ function smin(a: number, b: number, k: number): number {
   return b + (a - b) * h - k * h * (1 - h);
 }
 
-// ——— tiny vec2 helpers for the cone SDF (avoid THREE allocations in the hot loop) ———
-type V2 = [number, number];
-function vec2Make(x: number, y: number): V2 { return [x, y]; }
-function vec2Dot(a: V2, b: V2): number { return a[0] * b[0] + a[1] * b[1]; }
-function vec2Sub(a: V2, b: V2): V2 { return [a[0] - b[0], a[1] - b[1]]; }
-function vec2Mul(a: V2, s: number): V2 { return [a[0] * s, a[1] * s]; }
 function clamp(x: number, lo: number, hi: number): number { return Math.min(hi, Math.max(lo, x)); }
 
 // ——— fBm noise displacement (deterministic, seeded) ———
@@ -272,10 +267,17 @@ export function expandProgram(program: ShapeProgram): ShapeProgram {
       if (!tmpl) continue;
       const axis = sym.axis ?? 'y';
       const count = clamp(Math.round(sym.count), 2, 16);
+      // `radius` is the ring radius: translate the part OUTWARD (perpendicular
+      // to the rotation axis), then rotate copies around the axis. Translating
+      // along the axis itself (the old bug) left every copy coincident when the
+      // part was authored at the origin — the documented LLM usage.
+      // Outward = +x for rings around y or z (parts are conventionally authored
+      // with their long axis along +x), +y for rings around x.
+      const outward: 'x' | 'y' | 'z' = (['y', 'x', 'x'] as const)[axisIndex(axis)];
       for (let i = 0; i < count; i++) {
         const ang = (i / count) * Math.PI * 2;
         for (const op of tmpl) {
-          ops.push(rotateAroundAxis(translateOp(op, sym.radius, axis), ang, axis, sym.spin));
+          ops.push(rotateAroundAxis(translateOp(op, sym.radius, outward), ang, axis, sym.spin));
         }
       }
     } else if (sym.kind === 'linear') {
@@ -599,8 +601,11 @@ export const PRESET_PROGRAMS: Record<string, ShapeProgram> = {
     roughness: 0.15,
     parts: [
       { name: 'shard', ops: [
-        { prim: 'octahedron', mode: 'union', color: '#7b6cf0', pos: [0, 0.45, 0.5], r: 0.16 },
-        { prim: 'cone', mode: 'union', color: '#9a8af5', pos: [0, 0.7, 0.5], r: 0.07, h: 0.35 },
+        // Authored at the origin; the radial symmetry's `radius` places the
+        // ring. (Previously pre-offset in z to mask the old translate-along-axis
+        // bug, which also lifted shards +0.5 in Y and clipped them at the bound.)
+        { prim: 'octahedron', mode: 'union', color: '#7b6cf0', pos: [0, 0.45, 0], r: 0.16 },
+        { prim: 'cone', mode: 'union', color: '#9a8af5', pos: [0, 0.7, 0], r: 0.07, h: 0.35 },
       ] },
     ],
     symmetries: [
@@ -617,11 +622,12 @@ export const PRESET_PROGRAMS: Record<string, ShapeProgram> = {
     roughness: 0.6,
     parts: [
       { name: 'petal', ops: [
-        { prim: 'ellipsoid', mode: 'union', color: '#e85a9b', pos: [0.42, 0.05, 0], rot: [0, 0, -15], size: [0.32, 0.04, 0.16] },
+        // Canonical DSL usage: part authored at the origin, ring placed by `radius`.
+        { prim: 'ellipsoid', mode: 'union', color: '#e85a9b', pos: [0, 0.05, 0], rot: [0, 0, -15], size: [0.32, 0.04, 0.16] },
       ] },
     ],
     symmetries: [
-      { kind: 'radial', of: 'petal', count: 6, radius: 0, axis: 'y', spin: true },
+      { kind: 'radial', of: 'petal', count: 6, radius: 0.42, axis: 'y', spin: true },
     ],
     ops: [
       { prim: 'capsule', mode: 'union', color: '#3a8a3a', pos: [0, -0.65, 0], size: [0, 0.85, 0], r: 0.045 },
@@ -821,3 +827,4 @@ export async function refineProgramWithAI(current: ShapeProgram, instruction: st
     return null;
   }
 }
+// (2026-07-06 audit pass: radial-symmetry placement + GPU expansion fixes verified by smoke test)

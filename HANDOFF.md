@@ -19,6 +19,20 @@ The **MVP** is the **NCP Chat** (`src/components/NaturalConversationProgramming.
 
 ---
 
+## What changed in the 2026-07-06 audit pass (Claude)
+
+A full verification sweep of every claim from the prior sessions, against the code, the production D1, and the live site. Outcome: the architecture claims held (durable chat verified live end-to-end; prod bundle matches local), but **three real 3D engine bugs** were found and fixed in `src/lib/`:
+
+1. **GPU symmetry drop** (`sdf-gpu.ts`): `compileProgramAuto` gated GPU-compatibility on the expanded program but passed the *unexpanded* program to `generateMeshGPU`, so WebGPU browsers silently lost every symmetry-generated op (flower rendered with no petals). Fix: pass `expanded`.
+2. **Radial-array placement** (`sdf-compiler.ts`): `radius` translated parts along the rotation axis instead of outward — the documented "part at origin + radius" usage produced coincident copies. Fix: translate perpendicular to the axis (+x for y/z rings, +y for x rings). Crystal/flower presets re-authored to canonical form.
+3. **Cone SDF sign error** (`sdf-compiler.ts`): the sign term used a dot product where IQ's exact cone uses a 2D cross product, producing phantom "inside" regions in a far-field wedge for rotated cones (crystal preset: 60k tris of phantom shell clipping at the lattice bound → 13k clean tris after fix). Replaced with a faithful IQ sdCone port.
+
+Also corrected in docs: the RESEARCH.md "BLOCKER" about `spec_data`/`ai_log` was wrong — both tables exist in production D1 (verified by query); the real gap is that they're missing from `migrations/` (reproducibility) and `ai_log` lacks token/cost/status columns. See the audit addendum at the top of `RESEARCH.md`.
+
+Verification: `tsc --noEmit` clean; CPU smoke tests green on all 6 presets (no NaNs, all in-bounds); radial expansion emits a correct ring; durable chat + chat-sync + ai-stats verified live on production.
+
+---
+
 ## What changed in the 2026-07-05 pass
 
 ### 1. MVP chat — was silently broken, now durable and survives a closed browser
@@ -33,7 +47,7 @@ The **MVP** is the **NCP Chat** (`src/components/NaturalConversationProgramming.
 - The repo **already contained a complete real text-to-3D pipeline** in `src/lib/` (`meshforge.ts`, `sdf-compiler.ts`, `sdf-gpu.ts` — WGSL WebGPU kernel + CPU marching-tets fallback), but only the buried IDE → 3D tab exposed it. The visible "3D Viewport" sidebar item was a fake: `handleGenerate` was a 1.5s `setTimeout` that cycled Humanoid→Animal→Mech, and "Export Model" was an `alert("... (Mock)")`.
 - **`Viewport3DSection.tsx` rewritten** to drive the real pipeline:
   - `composeWithAI(prompt)` → LLM emits a `ShapeProgram` (SDF primitive JSON); `sanitizeProgram` + 6 presets (`snowman`/`rocket`/`mushroom`/`dragon`/`crystal`/`flower`) + `parsePromptLocally` parametric fallback chain (deterministic-first per AGENTS.md §1).
-  - `compileProgramAuto(program)` → WebGPU first @112³ for the original 5 primitives, automatic CPU fallback @60³ when the program uses cone/hex/octahedron/warp or expanded symmetries.
+  - `compileProgramAuto(program)` → WebGPU first @112³ when the *expanded* program uses only the original 5 primitives (≤24 ops, no warp) — symmetry-expanded programs now run on the GPU correctly; automatic CPU fallback @60³ for cone/hex/octahedron/warp or >24 expanded ops. (**2026-07-06 audit fix:** the GPU path previously received the unexpanded program and silently dropped all symmetry-generated ops.)
   - **Real `.glb` export** via `exportGLB()` → downloads a binary glTF.
   - **Refine loop** (`refineProgramWithAI`) — iterative prompt editing ("make it taller", "add a sphere on top").
   - Live stats HUD: triangles, op count, backend (gpu/cpu/preset), field ms, total ms, glb KB, source.

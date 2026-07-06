@@ -408,7 +408,10 @@ export async function compileProgramAuto(program: ShapeProgram, gpuRes = 112, cp
 
   if (gpuCompatible) {
     try {
-      const gpu = await generateMeshGPU(program, gpuRes);
+      // CRITICAL: pass the EXPANDED program. packOps reads program.ops directly,
+      // so passing the raw program would silently drop every symmetry-generated
+      // op on the GPU path (e.g. a flower rendering with no petals).
+      const gpu = await generateMeshGPU(expanded, gpuRes);
       if (gpu && gpu.triangles > 0) {
         const material = new THREE.MeshStandardMaterial({
           vertexColors: true,

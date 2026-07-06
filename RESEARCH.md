@@ -2,6 +2,27 @@
 
 **Date:** 2026-07-05
 **Status:** Research complete. Implementation pending your approval.
+**Audited:** 2026-07-06 (Claude) — every major claim in this document was verified against the code, the production D1 database, and the live site. Corrections are marked **[AUDIT 2026-07-06]** inline; the full audit findings live in the addendum immediately below.
+
+---
+
+## AUDIT ADDENDUM (2026-07-06) — what was verified, what was wrong
+
+**Verified TRUE by execution (not just code reading):**
+- The 3D pipeline is real end-to-end: all 6 presets compile to valid meshes (5.9k–25k triangles, zero NaN vertices), the symmetry DSL expands correctly, the sanitizer survives hostile LLM output, and `.glb` export uses three's real binary GLTFExporter.
+- Durable chat is real on production: a live test workflow (`POST /api/chat` → D1 rows with correct `user`/`ai` roles → `status: complete` → full history read-back) round-tripped in ~2s on `aura.massivenumber.com`.
+- Production serves the exact same bundle as local `dist/` (`index-C5tc1rET.js`) — site and desktop are in sync.
+- `/api/ai-stats` and `/api/chat-sync` both work live (kimi-k2.6 via AI Gateway).
+
+**Claims in this document that were WRONG (now corrected inline):**
+1. **The §12 "BLOCKER" was false.** `spec_data` and `ai_log` DO exist in production D1 (verified by direct query — they were created out-of-band). No endpoint is throwing. The real, smaller issue: the tables are absent from `migrations/`, so a fresh environment can't be reproduced, and `ai_log` lacks `tokens_in/out`, `cost_usd`, `status` columns. (`created_at` exists, contrary to §4.)
+2. **The "3D Viewport — Done" verdict hid three real bugs**, all found and fixed in the 2026-07-06 audit pass:
+   - `compileProgramAuto` handed the **unexpanded** program to the GPU kernel, so on WebGPU browsers (the primary path) every symmetry-generated op was silently dropped — the flower preset rendered with no petals. GLM's smoke test only exercised the CPU path, which is why it passed.
+   - The radial-array DSL translated parts **along** the rotation axis instead of outward, so the documented LLM usage ("part at origin + radius") produced coincident copies spinning in place. The presets were hand-tuned in ways that masked this.
+   - The cone SDF used a dot product in its sign term where IQ's exact formula uses a 2D cross product — negative (inside) values in a far-field wedge produced phantom geometry for rotated cones. Latent since the cone was added.
+   All three are fixed, typechecked, and re-verified by smoke test (crystal preset: was 60k tris with phantom shell clipping at the lattice bound → now 13k clean tris fully in-bounds).
+
+**Net effect on the roadmap:** Tier 1 item 1.1 shrinks (schema-widening only, not table creation); everything else stands.
 
 This document is the consolidated output of a full SOTA sweep across every sidebar feature (current as of July 2026 — no stale data). Each feature gets: what's there now, what 2026 best-in-class actually looks like, an honest verdict (keep / reframe / cut / merge), and a concrete code-ready upgrade plan ranked by impact and effort.
 
@@ -28,7 +49,7 @@ The roadmap at the bottom front-loads those free wins.
 | # | Feature | Current state | Verdict | Top action |
 |---|---------|--------------|---------|-----------|
 | ✅ | NCP Chat (MVP) | Durable Workflow (done) | **Done** | — |
-| ✅ | 3D Viewport | Real LLM→SDF→WebGPU (done) | **Done** | — |
+| ✅ | 3D Viewport | Real LLM→SDF→WebGPU (done; 3 symmetry/GPU/cone bugs fixed in the 07-06 audit) | **Done** | — |
 | 1 | IDE Workspace | Monaco + xterm + /api/exec (dev-only) | **Upgrade** | AI inline-edit (NCP→diff), isomorphic-git, OPFS, WebContainers |
 | 2 | Deep Research | Single fake "swarm crawl" prompt | **Rebuild** | Real Workflow: Tavily search + fetch + extract + cite |
 | 3 | Multi-Agent Builder | Single "simulate agents" prompt | **Rebuild** | Anthropic orchestrator pattern on Cloudflare Agents SDK |
@@ -152,7 +173,7 @@ The roadmap at the bottom front-loads those free wins.
 
 **The plan:** New `MaintenanceSweepWorkflow` with steps: `collect d1 metrics` → `detect ai spend anomaly` → `scan r2 orphans` → `route outcomes` (auto-remediate via Queue or alert via Cloudflare Email). Bind it on a 4-hour schedule. Decision framework: trivial (R2 orphan, KV stale) = auto-fix; medium (D1 80% full) = archive + alert; high (spend 3σ, p95 2× regression, anything payments) = alert only — never auto-touch AccountManagement.
 
-**Prereq:** widen the `ai_log` schema — it currently lacks `created_at`, `tokens_in/out`, `cost_usd`, `status`. Without timestamps you cannot do time-windowed anomaly detection.
+**Prereq:** widen the `ai_log` schema — it lacks `tokens_in/out`, `cost_usd`, `status` (**[AUDIT 2026-07-06]:** `created_at` already exists in the live table). Token/cost columns are still required for spend-anomaly detection.
 
 **Sources:** [Trigger Workflows (scheduled)](https://developers.cloudflare.com/workflows/build/trigger-workflows/), [Workflows limits](https://developers.cloudflare.com/workflows/reference/limits/), [AI Gateway spend limits](https://developers.cloudflare.com/ai-gateway/features/spend-limits/), [Cloudflare Queues](https://developers.cloudflare.com/queues/), [D1 has no auto-VACUUM](https://github.com/cloudflare/cloudflare-docs/issues/1618).
 
@@ -256,7 +277,7 @@ The roadmap at the bottom front-loads those free wins.
 
 **SOTA (2026):** D1 GA since April 2024. **10 GB cap, no auto-VACUUM.** **Time Travel** (GA) — point-in-time recovery to any minute in last 30 days. **Global read replication PUBLIC BETA** (free, sequential consistency via Sessions API). Schema introspection via `sqlite_master` + PRAGMAs (`table_info`, `foreign_key_list`, `index_list`) — no `information_schema`. Query analytics via GraphQL Analytics API (`d1QueriesAdaptiveGroups`). `@xyflow/react` (react-flow v12) ships a purpose-built Database Schema node example. `wrangler d1 migrations` is the canonical migration tool.
 
-**BLOCKER found:** `migrations/0001_chat_history.sql` only creates `chat_messages` + `chat_runs`. **It does NOT create `spec_data` or `ai_log`**, which `worker.ts` writes to (`PUT /api/spec`, `logAi()`, `/api/ai-stats`). Either they exist out-of-band or those endpoints are throwing at runtime. **Fix this first** with `migrations/0002_spec_and_ai_log.sql`.
+**[AUDIT 2026-07-06 — downgraded from BLOCKER]:** `migrations/0001_chat_history.sql` only creates `chat_messages` + `chat_runs`; `spec_data` and `ai_log` are absent from migrations. **However, both tables DO exist in production D1** (verified by direct query — created out-of-band) and no endpoint is throwing. The real issue is reproducibility: a fresh environment built from migrations alone would break those endpoints. Fix with `migrations/0002_spec_and_ai_log.sql` capturing the live schema (`ai_log` already has `created_at`) plus the new columns (`tokens_in/out`, `cost_usd`, `status`).
 
 **Plan:** Fix schema drift → add `GET /api/schema` introspection endpoint → react-flow ER view → read-only query analytics via GraphQL proxy → (defer) admin CRUD gated behind identity work.
 
@@ -413,7 +434,7 @@ These are the features that make AuraFlare genuinely best-in-class rather than h
 
 A few items unlock many features and should land early:
 
-1. **`migrations/0002_*.sql`** — widen `ai_log` (`created_at`, tokens, cost, status) AND create `spec_data`/`ai_log` (which are currently missing) AND add `user_id` to chat tables. One migration, three concerns. Unblocks Analytics, Workflows, Database viz, Identity.
+1. **`migrations/0002_*.sql`** — capture the live `spec_data`/`ai_log` schemas in migrations (they exist in prod but not in `migrations/` — **[AUDIT 2026-07-06]** verified live, so this is reproducibility, not a runtime fix), widen `ai_log` (tokens, cost, status; `created_at` already exists), and add `user_id` to chat tables. One migration, three concerns. Unblocks Analytics, Workflows, Database viz, Identity.
 2. **`CF_API_TOKEN` Wrangler secret** (scoped to Workers Scripts:Edit + Account:Read + AI Gateway read) — unblocks Edge Matrix, Edge Functions, CI/CD rollback, Analytics GraphQL, real deploys.
 3. **A shared client-side workspace store (Zustand)** — unblocks AI inline-edit (2.1), real time-travel (Zundo, 2.x), and consistent state across NCP↔IDE.
 4. **Cloudflare Email binding** (`send_email`) — unblocks Workflows alerts (2.4) and Docs/Support escalation (2.7). Free, GA.
