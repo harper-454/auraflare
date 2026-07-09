@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { User, signInWithPopup, GoogleAuthProvider, signOut } from 'firebase/auth';
 import { auth } from '../firebase';
+import { setGeminiOAuthToken } from '../lib/ai-providers';
 
 interface AuthContextType {
   user: User | null;
@@ -32,14 +33,22 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const signIn = async () => {
     const provider = new GoogleAuthProvider();
+    // Ask for Gemini API access alongside identity so "sign in with Google"
+    // doubles as the OAuth-first AI provider (see lib/ai-providers.ts). The
+    // popup's access token is short-lived (~1h) — kept in sessionStorage and
+    // dropped by the provider chain on 401/403.
+    provider.addScope('https://www.googleapis.com/auth/generative-language');
     try {
-      await signInWithPopup(auth, provider);
+      const result = await signInWithPopup(auth, provider);
+      const cred = GoogleAuthProvider.credentialFromResult(result);
+      if (cred?.accessToken) setGeminiOAuthToken(cred.accessToken);
     } catch (error) {
       console.error("Auth error", error);
     }
   };
 
   const logOut = async () => {
+    setGeminiOAuthToken(null);
     await signOut(auth);
   };
 

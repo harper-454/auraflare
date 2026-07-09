@@ -10,6 +10,7 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "lint:worker": "tsc -p tsconfig.worker.json",
+    "smoke:3d": "tsx scripts/smoke-3d.ts",
     "start": "node dist/server.cjs",
     "deploy:cf": "vite build && wrangler deploy",
     "cf:dev": "vite build && wrangler dev",

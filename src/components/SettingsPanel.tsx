@@ -1,11 +1,179 @@
 import { motion, AnimatePresence } from 'motion/react';
-import { Settings, X, Moon, Sun, Download, Upload, LayoutGrid } from 'lucide-react';
+import { Settings, X, Moon, Sun, Download, Upload, LayoutGrid, Bot, KeyRound, LogIn } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { StorageService } from '../lib/storage';
 import { SECTIONS, GROUP_LABELS, GROUP_ORDER, getHiddenSections, setHiddenSections } from '../sections';
+import { getProviderSettings, saveProviderSettings, getGeminiOAuthToken, newId, PROVIDER_TEMPLATES, type CustomProvider, type ProviderSettings } from '../lib/ai-providers';
+import { useAuth } from './AuthProvider';
 import type { SectionId } from '../types';
 
-type Tab = 'general' | 'features';
+type Tab = 'general' | 'features' | 'providers';
+
+/**
+ * BYO-model settings. Chain order: Google sign-in (Gemini OAuth) → the provider
+ * list below, top to bottom → AuraFlare Cloud (built-in, always-on fallback).
+ * Providers are added from templates (Gemini / ChatGPT / Claude / Openference /
+ * local LLMs) or fully custom — anything OpenAI-compatible works.
+ */
+function ProvidersTab() {
+  const { user, signIn } = useAuth();
+  const [settings, setSettings] = useState<ProviderSettings>(() => getProviderSettings());
+  const [hasOAuth, setHasOAuth] = useState<boolean>(() => !!getGeminiOAuthToken());
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [pickerOpen, setPickerOpen] = useState(false);
+
+  const commit = (next: ProviderSettings) => { setSettings(next); saveProviderSettings(next); };
+  const patch = (id: string, p: Partial<CustomProvider>) =>
+    commit({ providers: settings.providers.map(x => x.id === id ? { ...x, ...p } : x) });
+  const move = (id: string, dir: -1 | 1) => {
+    const list = [...settings.providers];
+    const i = list.findIndex(x => x.id === id);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= list.length) return;
+    [list[i], list[j]] = [list[j], list[i]];
+    commit({ providers: list });
+  };
+
+  const field = (label: string, value: string | undefined, placeholder: string, onChange: (v: string) => void, type: 'password' | 'text' = 'text') => (
+    <label className="block">
+      <span className="text-[10px] font-medium text-slate-500">{label}</span>
+      <input
+        type={type}
+        value={value ?? ''}
+        placeholder={placeholder}
+        onChange={e => onChange(e.target.value)}
+        className="mt-0.5 w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500"
+      />
+    </label>
+  );
+
+  return (
+    <div className="space-y-4 overflow-y-auto pr-1" style={{ maxHeight: 'calc(100vh - 16rem)' }}>
+      <p className="text-xs text-slate-500">
+        Bring your own models. Tried top to bottom; AuraFlare Cloud is the built-in default and final fallback. Keys never leave this browser.
+      </p>
+
+      <div>
+        <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-2">Sign in (OAuth first)</h3>
+        <button
+          onClick={async () => { await signIn(); setHasOAuth(!!getGeminiOAuthToken()); }}
+          className="w-full flex items-center justify-center gap-2 px-4 py-2 bg-slate-900 border border-slate-800 hover:bg-slate-800 text-slate-300 rounded-md text-xs font-medium transition-colors"
+        >
+          <LogIn className="w-3.5 h-3.5" />
+          {user ? `Signed in as ${user.email ?? user.displayName ?? 'Google user'}` : 'Sign in with Google (Gemini)'}
+        </button>
+        <p className={`mt-1.5 text-[10px] ${hasOAuth ? 'text-emerald-400' : 'text-slate-600'}`}>
+          {hasOAuth
+            ? '✓ Gemini OAuth active — tried before everything below'
+            : user
+              ? 'Signed in, but no Gemini token this session — sign in again to grant it.'
+              : 'Gemini access with your Google account — no API key needed.'}
+        </p>
+      </div>
+
+      <div className="pt-3 border-t border-slate-800/50">
+        <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-2">Your providers</h3>
+
+        {settings.providers.length === 0 && (
+          <p className="text-[11px] text-slate-600 mb-2">None yet — the built-in default handles everything until you add one.</p>
+        )}
+
+        <div className="space-y-1.5">
+          {settings.providers.map((p, i) => (
+            <div key={p.id} className="bg-slate-900 border border-slate-800 rounded-md">
+              <div className="flex items-center gap-2 px-2.5 py-2">
+                <input
+                  type="checkbox"
+                  checked={p.enabled}
+                  onChange={e => patch(p.id, { enabled: e.target.checked })}
+                  className="accent-indigo-500"
+                  title={p.enabled ? 'Enabled' : 'Disabled'}
+                />
+                <button onClick={() => setExpanded(expanded === p.id ? null : p.id)} className="flex-1 text-left">
+                  <span className={`text-xs font-medium ${p.enabled ? 'text-slate-200' : 'text-slate-500'}`}>{p.name}</span>
+                  <span className="ml-2 text-[10px] font-mono text-slate-500">{p.model}</span>
+                  {!p.apiKey && p.kind !== 'openai' && <span className="ml-2 text-[9px] text-amber-400">no key</span>}
+                </button>
+                <button onClick={() => move(p.id, -1)} disabled={i === 0} className="text-slate-600 hover:text-slate-300 disabled:opacity-30 text-[10px]" title="Higher priority">▲</button>
+                <button onClick={() => move(p.id, 1)} disabled={i === settings.providers.length - 1} className="text-slate-600 hover:text-slate-300 disabled:opacity-30 text-[10px]" title="Lower priority">▼</button>
+                <button
+                  onClick={() => commit({ providers: settings.providers.filter(x => x.id !== p.id) })}
+                  className="text-slate-600 hover:text-rose-400"
+                  title="Remove provider"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+              {expanded === p.id && (
+                <div className="px-2.5 pb-2.5 space-y-1.5 border-t border-slate-800/60 pt-2">
+                  {field('Name', p.name, 'My provider', v => patch(p.id, { name: v }))}
+                  {field('API key', p.apiKey, p.kind === 'openai' && p.baseUrl.includes('localhost') ? 'not needed for local' : 'sk-…', v => patch(p.id, { apiKey: v || undefined }), 'password')}
+                  {field('Model', p.model, 'model id', v => patch(p.id, { model: v }))}
+                  {field('Base URL', p.baseUrl, 'https://…', v => patch(p.id, { baseUrl: v }))}
+                  <p className="text-[9px] text-slate-600">Wire format: {p.kind === 'openai' ? 'OpenAI-compatible (/chat/completions)' : p.kind === 'anthropic' ? 'Anthropic Messages API' : 'Google Gemini REST'}</p>
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <div className="mt-2">
+          {!pickerOpen ? (
+            <button
+              onClick={() => setPickerOpen(true)}
+              className="w-full px-3 py-1.5 bg-slate-900 border border-dashed border-slate-700 hover:border-indigo-500 text-slate-400 hover:text-indigo-300 rounded-md text-[11px] font-medium transition-colors"
+            >
+              + Add provider
+            </button>
+          ) : (
+            <div className="space-y-1 bg-slate-900 border border-slate-800 rounded-md p-2">
+              {PROVIDER_TEMPLATES.map(t => (
+                <button
+                  key={t.name}
+                  onClick={() => {
+                    commit({ providers: [...settings.providers, { id: newId(), name: t.name, kind: t.kind, baseUrl: t.baseUrl, model: t.model, enabled: true }] });
+                    setPickerOpen(false);
+                    setExpanded(null);
+                  }}
+                  className="w-full text-left px-2 py-1.5 rounded hover:bg-slate-800 transition-colors"
+                >
+                  <span className="text-xs text-slate-200">{t.name}</span>
+                  <span className="block text-[9px] text-slate-500">{t.hint}</span>
+                </button>
+              ))}
+              <button
+                onClick={() => {
+                  commit({ providers: [...settings.providers, { id: newId(), name: 'Custom provider', kind: 'openai', baseUrl: '', model: '', enabled: true }] });
+                  setPickerOpen(false);
+                }}
+                className="w-full text-left px-2 py-1.5 rounded hover:bg-slate-800 transition-colors"
+              >
+                <span className="text-xs text-slate-200">Custom…</span>
+                <span className="block text-[9px] text-slate-500">Any OpenAI-compatible endpoint — hosted or local.</span>
+              </button>
+              <button onClick={() => setPickerOpen(false)} className="w-full text-[10px] text-slate-500 hover:text-slate-300 pt-1">cancel</button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="pt-3 border-t border-slate-800/50">
+        <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Built-in default</h3>
+        <div className="bg-slate-900 border border-slate-800 rounded-md px-2.5 py-2 flex items-center justify-between">
+          <div>
+            <span className="text-xs font-medium text-slate-200">AuraFlare Cloud</span>
+            <span className="block text-[9px] text-slate-500">Free · Workers AI — llama-3.3-70b (3D compose) + kimi-k2.6 (chat). Own trained model on the roadmap.</span>
+          </div>
+          <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400">ALWAYS ON</span>
+        </div>
+      </div>
+
+      <p className="text-[10px] text-slate-600 pt-2 border-t border-slate-800/50 flex items-center gap-1.5">
+        <KeyRound className="w-3 h-3" /> Used by 3D compose/refine and prompt parsing. Changes apply immediately.
+      </p>
+    </div>
+  );
+}
 
 export function SettingsPanel() {
   const [isOpen, setIsOpen] = useState(false);
@@ -80,15 +248,23 @@ export function SettingsPanel() {
                 >
                   <LayoutGrid className="w-3.5 h-3.5" /> Features
                 </button>
+                <button
+                  onClick={() => setTab('providers')}
+                  className={`flex-1 flex items-center justify-center gap-1.5 py-1.5 rounded text-xs font-medium transition-colors ${tab === 'providers' ? 'bg-slate-800 text-slate-100' : 'text-slate-500 hover:text-slate-300'}`}
+                >
+                  <Bot className="w-3.5 h-3.5" /> AI
+                </button>
               </div>
+
+              {tab === 'providers' && <ProvidersTab />}
 
               {tab === 'features' && (
                 <div className="space-y-5 overflow-y-auto pr-1" style={{ maxHeight: 'calc(100vh - 16rem)' }}>
                   <p className="text-xs text-slate-500">
-                    Show or hide sections from the sidebar. Primary and Account sections are always visible.
+                    Show or hide sections from the sidebar. Create and Account sections are always visible.
                   </p>
                   {GROUP_ORDER
-                    .filter(g => g !== 'primary' && g !== 'admin')
+                    .filter(g => g !== 'create' && g !== 'admin')
                     .map(group => {
                       const items = SECTIONS.filter(s => s.group === group);
                       if (items.length === 0) return null;
