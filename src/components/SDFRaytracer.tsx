@@ -102,21 +102,22 @@ void main() {
   vec3 ro = uCamPos;
   vec3 rd = getRayDir(vUv);
 
-  // Sphere-trace
-  float t = 0.0;
+  // Sphere-trace. The default orbit camera sits ~7 units out, so the march
+  // budget must comfortably exceed that (a 5.0 cap made EVERY ray miss —
+  // the preview rendered nothing while reporting no errors). Models live in
+  // [-1.2,1.2]³, so skip ahead to just outside that bound before stepping.
+  float t = max(0.0, length(ro) - 2.5);
   bool hit = false;
   for (int i = 0; i < 96; i++) {
     float d = sdf(ro + t * rd);
     if (d < 0.0005) { hit = true; break; }
     t += d;
-    if (t > 5.0) break;
+    if (t > 20.0) break;
   }
 
-  if (!hit) {
-    // Sky / background — match the Canvas background colour.
-    gl_FragColor = vec4(0.059, 0.090, 0.161, 1.0);
-    return;
-  }
+  // Miss → discard so the scene (grid, shadows) shows through; the preview
+  // only owns the pixels the model actually covers.
+  if (!hit) discard;
 
   vec3 pos  = ro + t * rd;
   vec3 nor  = calcNormal(pos);
@@ -226,7 +227,11 @@ export function SDFRaytracer({ program }: SDFRaytracerProps) {
   });
 
   return (
-    <mesh renderOrder={-1}>
+    // renderOrder 1: draw AFTER the grid/shadows so the traced model paints
+    // over them (at -1 the grid was drawn on top of the preview). Culling off:
+    // the plane's bounds are meaningless — the vertex shader ignores every
+    // transform, so three must never frustum-cull it away.
+    <mesh renderOrder={1} frustumCulled={false}>
       {/* PlaneGeometry(2,2) has vertex positions in [-1,1] — the vertex shader
           uses them directly as NDC coordinates, bypassing the camera. */}
       <planeGeometry args={[2, 2]} />

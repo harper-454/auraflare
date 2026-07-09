@@ -17,6 +17,24 @@
 
 **Also in this tree (built by a parallel session, verified here):** MASTERPLAN 3D-2 — `SDFRaytracer.tsx` + `sdf-glsl.ts` live sphere-traced preview while typing (PREVIEWING state), and `buildPreviewProgram` (deterministic keyword composer) with `scripts/test-10models.ts` — 10/10 novel prompts pass offline.
 
+## 2026-07-08 fourth pass — moving parts, the factory pipeline, and self-QA
+
+Owner directive: complex multi-part models with FUNCTION — a watch with gears and hands, an engine with working pistons — plus a coarse-to-fine process (lay parts out on a grid, then refine) and a pre-delivery self-review. Process patterns were mined from the owner's **AssetForge** project (C:\Users\alexh\Developer\AssetForge): planner-owns-decomposition, category part-priors with roles, rig plan before build, QA as promotion blocker.
+
+**Articulated assemblies** (`assemblies[]` on ShapeProgram, sdf-compiler.ts): named parts authored full-size in their local frame with `place {pos, rot, scale}` (the scale-down multiplies effective per-part resolution — every part gets its own 144³ lattice) and `motion {spin rpm | oscillate deg/freq | piston dist/freq/phase}` about the part's own pivot. Sanitizer clamps everything; `flattenProgram` bakes assemblies to exact static ops (quaternion-composed) for the raytracer preview; `totalProgramOps` gates validity.
+
+**sdf-assembly.ts**: compiles base + each assembly SEPARATELY through compileProgramAuto (own mesh, own material), builds pivot/placement group trees, returns `animators` (driven every frame in the viewport via `applyAnimators` — same math the smoke test pins to 1e-6) and **baked AnimationClips sampled at 30 Hz from that same math — the exported .glb MOVES in any glTF viewer**.
+
+**Two-pass compose** (`composeComplexWithAI`): pass 1 plans parts on the coordinate grid (name, role, pos, scale, motion, hint — with AssetForge-style category priors: timepiece/engine/vehicle/windmill…); pass 2 refines every part's ops in its local frame in one batched call; plan owns placement+motion, refine owns geometry; a skipped part degrades to a hint-colored primitive so the layout never loses parts. Mechanical-smelling prompts (`wantsComplexCompose`) route here first, then single-shot → buildPreviewProgram → parametric.
+
+**Pre-delivery QA** (`sdf-qa.ts`): before the user sees anything — offscreen 3/4 render of the compiled group → deterministic lint (out-of-bounds, moving part fully inside the base = invisible motion, duplicate placements, unison piston phases, same-sign meshing gears) → AI critique (vision via /api/media/describe when available, text-only via the provider chain otherwise) → ONE refine round with the findings → recompile. Never blocks delivery. Viewport shows INSPECTING during the pass and `qa: inspected · passed|revised` in the HUD.
+
+**Verified live in the browser:** pocket watch → GENERATING → INSPECTING → MESH READY, **6 parts · 5 moving, qa inspected · revised** (ops 11→15 after self-revision), gpu @144³, hands visibly sweeping with the camera locked; 4-cylinder engine → **7 parts · 6 moving**, 53.6k tris in 35.6 s via AuraFlare Cloud. Smoke suite grew an assemblies section (19 checks total: sanitize/slug/flatten-exactness/pose-math/clip-baking). Also this pass: the raytracer's invisible-preview bug (march budget 5.0 < camera distance 7.1 — every ray missed at default zoom) fixed with budget 20 + skip-ahead + discard-on-miss + renderOrder; plus the parallel session's 10 new preview shape families.
+
+**Known limits (honest):** visual composition quality still tracks the provider (GLM-5.2 built a spherical watch case pre-QA; the QA round flattened it); gears often end up occluded — the lint flags it but the reviser doesn't always fix placement; animated-GLB clips are baked from verified math but haven't been opened in an external viewer yet; engine piston motion is subtle at final scale (screenshot delta aliased at 1.6 s).
+
+---
+
 **Presets removed (owner: "the ones you have are junk").** The six hand-authored preset programs, their keyword fallback in `composeWithAI`, the PRESETS button row, AND the old humanoid/animal/mechanical placeholder rigs are gone from the product. Every model is now composed — by the AI provider chain, or offline by `buildPreviewProgram`'s heuristics (now also the offline fallback inside Generate, ahead of the parametric last resort). The idle viewport is just the grid until you type. The former presets survive only as polygonizer fixtures inside `scripts/smoke-3d.ts` (they exercise every primitive/mode/symmetry).
 
 **Known follow-ups:** the SDFRaytracer remounts spam a harmless `PCFSoftShadowMap deprecated` warning every frame-ish — worth a once-only guard; HUD could show *which* provider composed a mesh (chain already returns it); Anthropic/OpenAI/Gemini templates not yet exercised with real keys; component-internal copy for the 4 renamed sections still pending.

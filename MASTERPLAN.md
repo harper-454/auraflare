@@ -77,7 +77,9 @@ The current engine is real but capped at "stylized compositional models." The pa
 | 3D-5 | **Model gallery** on R2 (prod) / disk (dev) + share links | Turns generations into a library |
 | 3D-6 | **Optional paid tier**: Meshy/Fal/TRELLIS behind the same prompt box, SDF stays the free default | Product/budget decision — only after 3D-1…3D-4 |
 
-**Rule:** every 3D change re-runs the smoke suite (presets + symmetry expansion + hostile sanitizer + a GPU-path test in a real browser).
+| 3D-7 | ✅ (2026-07-08 fourth pass) **Articulated assemblies + factory pipeline** — `assemblies[]` in the shape program (per-part meshes, pivots, spin/oscillate/piston motion), two-pass compose (plan parts on the grid → refine each part; AssetForge-derived category priors), per-part effective-resolution via placement scale, live kinematics in the viewport, **animated .glb export** (baked clips), and a **pre-delivery QA loop** (offscreen render → lint → AI critique → revise once → recompile; `sdf-qa.ts`). Verified live: pocket watch 6 parts · 5 moving `qa: revised`; 4-cyl engine 7 parts · 6 moving. | Watches tick, engines run — no free competitor generates rigged, moving machines from text |
+
+**Rule:** every 3D change re-runs the smoke suite (fixtures + symmetry expansion + hostile sanitizer + assembly/animator math + a GPU-path test in a real browser).
 
 ---
 

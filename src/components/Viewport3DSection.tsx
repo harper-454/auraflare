@@ -9,8 +9,10 @@ import * as THREE from 'three';
 // The real text-to-3D pipeline (already shipped in src/lib, but only the
 // buried IDE > 3D tab exposed it). This view routes the same engine to the
 // visible "3D Viewport" surface so the prompt box actually generates a model.
-import { composeWithAI, refineProgramWithAI, buildPreviewProgram, type ShapeProgram } from '../lib/sdf-compiler';
+import { composeWithAI, composeComplexWithAI, wantsComplexCompose, refineProgramWithAI, buildPreviewProgram, flattenProgram, type ShapeProgram } from '../lib/sdf-compiler';
 import { compileProgramAuto, warmupGPU } from '../lib/sdf-gpu';
+import { compileAssemblies, applyAnimators, type Animator } from '../lib/sdf-assembly';
+import { qaReviewProgram } from '../lib/sdf-qa';
 import { applyTriplanarToGroup, loadTexture } from '../lib/sdf-material';
 import { parsePromptLocally, generateModel, exportGLB } from '../lib/meshforge';
 // 3D-2: live sphere-tracing preview — shows the SDF as a raymarched image
@@ -26,6 +28,9 @@ type Stats = {
   bytes: number;
   loadMs: number;
   source: 'ai' | 'local' | 'photo';
+  parts?: number;   // articulated part count (assemblies + static base)
+  moving?: number;  // how many parts carry a motion spec
+  qa?: 'passed' | 'revised' | 'skipped'; // pre-delivery inspection outcome
 };
 
 /**
@@ -58,11 +63,19 @@ const PROMPT_IDEAS = [
   'a colorful hot air balloon',
 ];
 
-// Renders an arbitrary generated THREE.Group inside the canvas, with auto-rotation.
-function GeneratedMesh({ group, spin }: { group: THREE.Group; spin: boolean }) {
+// Renders an arbitrary generated THREE.Group inside the canvas, with
+// auto-rotation of the whole model plus per-part kinematics (gears spin,
+// pistons stroke) driven from the assembly animators every frame.
+function GeneratedMesh({ group, spin, animators, motionOn }: {
+  group: THREE.Group;
+  spin: boolean;
+  animators: Animator[];
+  motionOn: boolean;
+}) {
   const root = useRef<THREE.Group>(null);
-  useFrame((_, delta) => {
+  useFrame(({ clock }, delta) => {
     if (spin && root.current) root.current.rotation.y += delta * 0.25;
+    if (motionOn && animators.length) applyAnimators(animators, clock.getElapsedTime());
   });
   useEffect(() => {
     if (root.current && group.parent !== root.current) {
@@ -98,6 +111,13 @@ export function Viewport3DSection() {
   const [isPhotoLoading, setIsPhotoLoading] = useState(false);
   const photoInputRef = useRef<HTMLInputElement>(null);
 
+  // Articulated assemblies: per-part animators drive live motion; the matching
+  // baked clips ride along into the .glb export.
+  const [animators, setAnimators] = useState<Animator[]>([]);
+  const clipsRef = useRef<THREE.AnimationClip[]>([]);
+  // Pre-delivery QA: the model inspects its own render and revises once.
+  const [isInspecting, setIsInspecting] = useState(false);
+
   // 3D-2: live preview — build a fresh ShapeProgram from the prompt text using
   // keyword heuristics (no preset lookup), then raymarch it while the AI compose
   // call runs.  buildPreviewProgram constructs every ShapeProgram from scratch.
@@ -108,6 +128,14 @@ export function Viewport3DSection() {
     }, 350);
     return () => clearTimeout(tid);
   }, [prompt]);
+
+  // The raytracer can't animate assemblies — bake them into a static pose
+  // (exact placement math) for the preview shader. Memoized: a fresh object
+  // per render would recompile the fragment shader every frame.
+  const previewFlat = useMemo(() => {
+    const p = lastProgram ?? previewProgram;
+    return p ? flattenProgram(p) : null;
+  }, [lastProgram, previewProgram]);
 
   // Auto-rotate toggle was the old "play/pause". Keep the affordance.
   const [isPlaying, setIsPlaying] = useState(true);
@@ -132,21 +160,60 @@ export function Viewport3DSection() {
       let resolution = 0;
       let fieldMs = 0;
       let source: Stats['source'] = 'ai';
+      let parts: number | undefined;
+      let moving: number | undefined;
+      let qa: Stats['qa'];
       let programForMat: ShapeProgram | null = null;
+      let newAnimators: Animator[] = [];
+      let newClips: THREE.AnimationClip[] = [];
 
-      // AI compose first; offline, buildPreviewProgram's heuristics compose a
-      // fresh program (same engine, no canned models); the parametric
+      // One compile path for both static programs and articulated assemblies.
+      const compileAny = async (p: ShapeProgram) => {
+        if (p.assemblies?.length) {
+          const c = await compileAssemblies(p);
+          return { group: c.group, triangles: c.triangles, opCount: c.opCount, backend: c.backend, resolution: c.resolution, fieldMs: c.fieldMs, parts: c.partCount as number | undefined, moving: c.animators.length as number | undefined, animators: c.animators, clips: c.clips };
+        }
+        const c = await compileProgramAuto(p);
+        return { group: c.group, triangles: c.triangles, opCount: c.opCount, backend: c.backend, resolution: c.resolution, fieldMs: c.fieldMs, parts: undefined as number | undefined, moving: undefined as number | undefined, animators: [] as Animator[], clips: [] as THREE.AnimationClip[] };
+      };
+
+      // Mechanical/composite prompts take the two-pass factory path
+      // (plan parts on the grid → refine each part), then the single-shot
+      // composer; offline, buildPreviewProgram composes fresh; the parametric
       // single-family generator is the absolute last resort.
-      const composed = await composeWithAI(text);
-      const program = composed?.program ?? buildPreviewProgram(text);
+      const composed = (wantsComplexCompose(text) ? await composeComplexWithAI(text) : null)
+        ?? await composeWithAI(text);
+      let program = composed?.program ?? buildPreviewProgram(text);
       if (program) {
-        const compiled = await compileProgramAuto(program);
+        let compiled = await compileAny(program);
+
+        // Pre-delivery QA — only for AI-composed models (it spends AI calls):
+        // render offscreen, lint, critique, revise once, recompile.
+        if (composed) {
+          setIsInspecting(true);
+          try {
+            const review = await qaReviewProgram(text, program, compiled.group);
+            qa = review.verdict;
+            if (review.program) {
+              const recompiled = await compileAny(review.program);
+              compiled = recompiled;
+              program = review.program;
+            }
+          } catch { qa = 'skipped'; } finally {
+            setIsInspecting(false);
+          }
+        }
+
         group = compiled.group;
         triangles = compiled.triangles;
         opCount = compiled.opCount;
         backend = compiled.backend;
         resolution = compiled.resolution;
         fieldMs = compiled.fieldMs;
+        parts = compiled.parts;
+        moving = compiled.moving;
+        newAnimators = compiled.animators;
+        newClips = compiled.clips;
         source = composed ? 'ai' : 'local';
         programForMat = program;
         setLastProgram(program);
@@ -160,11 +227,14 @@ export function Viewport3DSection() {
         setLastProgram(null);
         setLabel(spec.label || text.slice(0, 24));
       }
+      setAnimators(newAnimators);
+      clipsRef.current = newClips;
 
-      // .glb export carries geometry + vertex colors; the triplanar texture is
-      // a shader projection and has no glTF representation (yet — xatlas bake
-      // is the known follow-up), so export before texturing.
-      const blob = await exportGLB(group);
+      // .glb export carries geometry + vertex colors + BAKED MOTION CLIPS (the
+      // exported watch ticks in any glTF viewer); the triplanar texture is a
+      // shader projection and has no glTF representation (yet — xatlas bake is
+      // the known follow-up), so export before texturing.
+      const blob = await exportGLB(group, newClips);
       setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return URL.createObjectURL(blob); });
 
       if (photoDataUrl) {
@@ -182,6 +252,7 @@ export function Viewport3DSection() {
       setStats({
         triangles, opCount, backend, resolution, fieldMs,
         bytes: blob.size, loadMs: Math.round(performance.now() - loadStart.current), source,
+        parts, moving, qa,
       });
     } catch (e: any) {
       setError(`Generation failed: ${e?.message || e}`);
@@ -198,17 +269,30 @@ export function Viewport3DSection() {
     loadStart.current = performance.now();
     try {
       const updated = await refineProgramWithAI(lastProgram, instruction);
-      if (!updated) throw new Error('AI refine unavailable — set GEMINI_API_KEY or try again.');
-      const compiled = await compileProgramAuto(updated);
-      const blob = await exportGLB(compiled.group);
+      if (!updated) throw new Error('AI refine unavailable — configure a provider in Settings → AI or try again.');
+      let compiledGroup: THREE.Group;
+      let refStats: Omit<Stats, 'bytes' | 'loadMs' | 'source'>;
+      if (updated.assemblies?.length) {
+        const c = await compileAssemblies(updated);
+        compiledGroup = c.group;
+        refStats = { triangles: c.triangles, opCount: c.opCount, backend: c.backend, resolution: c.resolution, fieldMs: c.fieldMs, parts: c.partCount, moving: c.animators.length };
+        setAnimators(c.animators);
+        clipsRef.current = c.clips;
+      } else {
+        const c = await compileProgramAuto(updated);
+        compiledGroup = c.group;
+        refStats = { triangles: c.triangles, opCount: c.opCount, backend: c.backend, resolution: c.resolution, fieldMs: c.fieldMs };
+        setAnimators([]);
+        clipsRef.current = [];
+      }
+      const blob = await exportGLB(compiledGroup, clipsRef.current);
       setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return URL.createObjectURL(blob); });
-      setGeneratedGroup(compiled.group);
+      setGeneratedGroup(compiledGroup);
       setLastProgram(updated);
       setLabel(updated.label);
       setTextureInfo(null); // recompile rebuilds plain materials — texture is gone
       setStats({
-        triangles: compiled.triangles, opCount: compiled.opCount, backend: compiled.backend,
-        resolution: compiled.resolution, fieldMs: compiled.fieldMs,
+        ...refStats,
         bytes: blob.size, loadMs: Math.round(performance.now() - loadStart.current), source: 'ai',
       });
       setRefineText('');
@@ -322,7 +406,7 @@ export function Viewport3DSection() {
           <div className="flex gap-2 flex-wrap">
             <div className="px-3 py-1.5 bg-slate-950/80 backdrop-blur border border-slate-700 rounded text-xs font-mono text-indigo-400 flex items-center gap-2">
               <span className={`w-2 h-2 rounded-full ${isGenerating || isRefining || isTexturing || isPhotoLoading ? 'bg-amber-400 animate-pulse' : stats ? 'bg-emerald-400' : (previewProgram || lastProgram) ? 'bg-violet-400 animate-pulse' : 'bg-slate-500'}`} />
-              {isPhotoLoading ? 'READING PHOTO' : isGenerating ? 'GENERATING' : isRefining ? 'REFINING' : isTexturing ? 'TEXTURING' : stats ? 'MESH READY' : (previewProgram || lastProgram) && !generatedGroup ? 'PREVIEWING' : 'IDLE'}
+              {isPhotoLoading ? 'READING PHOTO' : isInspecting ? 'INSPECTING' : isGenerating ? 'GENERATING' : isRefining ? 'REFINING' : isTexturing ? 'TEXTURING' : stats ? 'MESH READY' : (previewProgram || lastProgram) && !generatedGroup ? 'PREVIEWING' : 'IDLE'}
             </div>
             {stats && (
               <div className="px-3 py-1.5 bg-slate-950/80 backdrop-blur border border-slate-700 rounded text-xs font-mono text-slate-300 flex items-center gap-1.5">
@@ -490,6 +574,8 @@ export function Viewport3DSection() {
             <div className="flex justify-between"><span className="text-slate-500">source</span><span className="text-indigo-300">{stats.source}</span></div>
             <div className="flex justify-between"><span className="text-slate-500">backend</span><span className="text-emerald-300">{stats.backend}{stats.resolution ? ` @${stats.resolution}³` : ''}</span></div>
             {stats.opCount !== null && <div className="flex justify-between"><span className="text-slate-500">ops</span><span className="text-slate-300">{stats.opCount}</span></div>}
+            {stats.parts !== undefined && stats.parts > 1 && <div className="flex justify-between"><span className="text-slate-500">parts</span><span className="text-amber-300">{stats.parts}{stats.moving ? ` · ${stats.moving} moving` : ''}</span></div>}
+            {stats.qa && stats.qa !== 'skipped' && <div className="flex justify-between"><span className="text-slate-500">qa</span><span className={stats.qa === 'revised' ? 'text-cyan-300' : 'text-emerald-300'}>{stats.qa === 'revised' ? 'inspected · revised' : 'inspected · passed'}</span></div>}
             <div className="flex justify-between"><span className="text-slate-500">triangles</span><span className="text-slate-300">{stats.triangles.toLocaleString()}</span></div>
             <div className="flex justify-between"><span className="text-slate-500">field</span><span className="text-slate-300">{stats.fieldMs} ms</span></div>
             <div className="flex justify-between"><span className="text-slate-500">total</span><span className="text-slate-300">{stats.loadMs} ms</span></div>
@@ -504,15 +590,15 @@ export function Viewport3DSection() {
           <spotLight position={[10, 10, 10]} angle={0.15} penumbra={1} intensity={spotIntensity} castShadow />
           <pointLight position={[-10, -10, -10]} intensity={0.5} />
 
-          {generatedGroup && <GeneratedMesh group={generatedGroup} spin={spin} />}
+          {generatedGroup && <GeneratedMesh group={generatedGroup} spin={spin} animators={animators} motionOn={isPlaying} />}
           {/* 3D-2: live raymarch preview — shows while the user types or while
               generation is running.  Priority: real mesh > AI program > local
               preview program.  The SDFRaytracer renders a full-screen
               sphere-traced SDF image; it disappears the moment the real
               polygonized mesh is ready.  With nothing to show, the empty
               grid awaits a prompt — no canned placeholder models. */}
-          {!generatedGroup && (lastProgram ?? previewProgram) && (
-            <SDFRaytracer program={(lastProgram ?? previewProgram)!} />
+          {!generatedGroup && previewFlat && (
+            <SDFRaytracer program={previewFlat} />
           )}
 
           <ContactShadows position={[0, -0.01, 0]} opacity={0.4} scale={10} blur={2} far={4} />

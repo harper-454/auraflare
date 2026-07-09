@@ -379,13 +379,15 @@ export function generateModel(prompt: string, spec: ShapeSpec): { group: THREE.G
   return { group, triangles };
 }
 
-export function exportGLB(group: THREE.Group): Promise<Blob> {
+export function exportGLB(group: THREE.Group, animations?: THREE.AnimationClip[]): Promise<Blob> {
   return new Promise((resolve, reject) => {
     new GLTFExporter().parse(
       group,
       result => resolve(new Blob([result as ArrayBuffer], { type: 'model/gltf-binary' })),
       err => reject(err),
-      { binary: true },
+      // Baked clips make the exported .glb MOVE in any glTF viewer — the
+      // watch ticks and the engine runs outside our app too.
+      { binary: true, animations: animations ?? [] },
     );
   });
 }

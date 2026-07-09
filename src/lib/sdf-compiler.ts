@@ -52,12 +52,47 @@ export interface Warp {
   seed?: number;
 }
 
+/** Kinematics for an assembly: how the part moves, forever, around its local origin. */
+export type MotionKind = 'spin' | 'oscillate' | 'piston';
+export interface Motion {
+  kind: MotionKind;
+  axis: 'x' | 'y' | 'z';
+  rpm?: number;    // spin: signed revolutions/minute (meshing gears alternate sign)
+  deg?: number;    // oscillate: swing amplitude in degrees
+  freq?: number;   // oscillate/piston: cycles per second
+  dist?: number;   // piston: travel amplitude (world units, pre-scale)
+  phase?: number;  // radians offset (piston firing order, gear alignment)
+}
+
+/** Where an assembly sits in the model. Authored full-size in its LOCAL frame,
+ *  then scaled down into place — which multiplies its effective resolution:
+ *  a gear at scale 0.25 gets ~4× the surface detail of the same gear authored
+ *  in world units, because it owns a whole polygonization lattice. */
+export interface Placement {
+  pos: [number, number, number];
+  rot?: [number, number, number]; // euler degrees
+  scale?: number;                 // uniform, 0.05–1.5
+}
+
+/** A named, separately-polygonized, independently-movable part. */
+export interface Assembly {
+  name: string;
+  ops: PrimOp[];
+  parts?: PartDef[];
+  symmetries?: Symmetry[];
+  place: Placement;
+  motion?: Motion;
+  metalness?: number;  // per-part material override (brass gears in a steel case)
+  roughness?: number;
+}
+
 export interface ShapeProgram {
   label: string;
   ops: PrimOp[];
   parts?: PartDef[];      // named reusable sub-trees (referenced by symmetries)
   symmetries?: Symmetry[]; // expand-time transforms (no kernel cost)
   warp?: Warp;            // optional field displacement
+  assemblies?: Assembly[]; // articulated parts — each compiles to its own mesh
   metalness?: number;
   roughness?: number;
 }
@@ -544,10 +579,10 @@ function vec3(x: unknown, d: [number, number, number], lo: number, hi: number): 
   return [num(x[0], d[0], lo, hi), num(x[1], d[1], lo, hi), num(x[2], d[2], lo, hi)];
 }
 
-export function sanitizeProgram(raw: any, fallbackLabel: string): ShapeProgram | null {
-  if (!raw || !Array.isArray(raw.ops) || raw.ops.length === 0) return null;
+function sanitizeOps(rawOps: any, cap: number): PrimOp[] {
   const ops: PrimOp[] = [];
-  for (const o of raw.ops.slice(0, 24)) {
+  if (!Array.isArray(rawOps)) return ops;
+  for (const o of rawOps.slice(0, cap)) {
     if (!o || !PRIMS.includes(o.prim)) continue;
     ops.push({
       prim: o.prim,
@@ -562,21 +597,80 @@ export function sanitizeProgram(raw: any, fallbackLabel: string): ShapeProgram |
       blend: o.blend !== undefined ? num(o.blend, 0.08, 0.01, 0.4) : undefined,
     });
   }
-  if (ops.length === 0) return null;
   // never let the first op be a subtraction from empty space
-  if (ops[0].mode === 'subtract' || ops[0].mode === 'intersect') ops[0].mode = 'union';
+  if (ops.length && (ops[0].mode === 'subtract' || ops[0].mode === 'intersect')) ops[0].mode = 'union';
+  return ops;
+}
 
-  // parts + symmetries (DSL layer) — passed through; expandProgram handles them.
-  const parts: PartDef[] | undefined = Array.isArray(raw.parts) && raw.parts.length
-    ? raw.parts.slice(0, 12).map((p: any) => ({
+function sanitizeParts(raw: any): PartDef[] | undefined {
+  const parts: PartDef[] | undefined = Array.isArray(raw) && raw.length
+    ? raw.slice(0, 12).map((p: any) => ({
         name: String(p.name || 'part').slice(0, 24),
         ops: (Array.isArray(p.ops) ? p.ops : []).slice(0, 16).filter((o: any) => o && PRIMS.includes(o.prim)),
       })).filter((p: PartDef) => p.ops.length > 0)
     : undefined;
+  return parts && parts.length ? parts : undefined;
+}
 
-  const symmetries: Symmetry[] | undefined = Array.isArray(raw.symmetries) && raw.symmetries.length
-    ? raw.symmetries.slice(0, 6).map(sanitizeSymmetry).filter((s: Symmetry | null): s is Symmetry => s !== null)
+function sanitizeSymmetries(raw: any): Symmetry[] | undefined {
+  const symmetries: Symmetry[] | undefined = Array.isArray(raw) && raw.length
+    ? raw.slice(0, 6).map(sanitizeSymmetry).filter((s: Symmetry | null): s is Symmetry => s !== null)
     : undefined;
+  return symmetries && symmetries.length ? symmetries : undefined;
+}
+
+const MOTION_KINDS: MotionKind[] = ['spin', 'oscillate', 'piston'];
+const AXES = ['x', 'y', 'z'] as const;
+
+function sanitizeMotion(m: any): Motion | undefined {
+  if (!m || typeof m !== 'object' || !MOTION_KINDS.includes(m.kind)) return undefined;
+  const axis = AXES.includes(m.axis) ? m.axis : 'y';
+  if (m.kind === 'spin') {
+    return { kind: 'spin', axis, rpm: num(m.rpm, 10, -240, 240), phase: num(m.phase, 0, -Math.PI * 2, Math.PI * 2) };
+  }
+  if (m.kind === 'oscillate') {
+    return { kind: 'oscillate', axis, deg: num(m.deg, 30, 1, 150), freq: num(m.freq, 1, 0.05, 8), phase: num(m.phase, 0, -Math.PI * 2, Math.PI * 2) };
+  }
+  return { kind: 'piston', axis, dist: num(m.dist, 0.3, 0.01, 0.8), freq: num(m.freq, 1, 0.05, 8), phase: num(m.phase, 0, -Math.PI * 2, Math.PI * 2) };
+}
+
+function sanitizeAssemblies(raw: any): Assembly[] | undefined {
+  if (!Array.isArray(raw) || !raw.length) return undefined;
+  const seen = new Set<string>();
+  const out: Assembly[] = [];
+  for (const a of raw.slice(0, 12)) {
+    if (!a || typeof a !== 'object') continue;
+    const ops = sanitizeOps(a.ops, 24);
+    if (!ops.length) continue;
+    let name = String(a.name || `part-${out.length + 1}`).toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || `part-${out.length + 1}`;
+    while (seen.has(name)) name = `${name}-2`;
+    seen.add(name);
+    const place = a.place && typeof a.place === 'object' ? a.place : {};
+    out.push({
+      name,
+      ops,
+      parts: sanitizeParts(a.parts),
+      symmetries: sanitizeSymmetries(a.symmetries),
+      place: {
+        pos: vec3(place.pos, [0, 0, 0], -1.2, 1.2),
+        rot: place.rot ? vec3(place.rot, [0, 0, 0], -180, 180) : undefined,
+        scale: place.scale !== undefined ? num(place.scale, 0.3, 0.05, 1.5) : undefined,
+      },
+      motion: sanitizeMotion(a.motion),
+      metalness: a.metalness !== undefined ? num(a.metalness, 0.15, 0, 1) : undefined,
+      roughness: a.roughness !== undefined ? num(a.roughness, 0.55, 0, 1) : undefined,
+    });
+  }
+  return out.length ? out : undefined;
+}
+
+export function sanitizeProgram(raw: any, fallbackLabel: string): ShapeProgram | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const ops = sanitizeOps(raw.ops, 24);
+  const assemblies = sanitizeAssemblies(raw.assemblies);
+  // Valid when the static ops OR the articulated parts carry real geometry.
+  const totalOps = ops.length + (assemblies?.reduce((n, a) => n + a.ops.length, 0) ?? 0);
+  if (totalOps === 0) return null;
 
   const warp: Warp | undefined = raw.warp && typeof raw.warp === 'object'
     ? { amp: num(raw.warp.amp, 0, 0, 0.2), freq: num(raw.warp.freq, 6, 0.5, 20), octaves: raw.warp.octaves ? Math.round(num(raw.warp.octaves, 4, 1, 6)) : 4, seed: raw.warp.seed ?? 0 }
@@ -585,12 +679,58 @@ export function sanitizeProgram(raw: any, fallbackLabel: string): ShapeProgram |
   return {
     label: typeof raw.label === 'string' && raw.label ? raw.label.slice(0, 48) : fallbackLabel,
     ops,
-    parts: parts && parts.length ? parts : undefined,
-    symmetries: symmetries && symmetries.length ? symmetries : undefined,
+    parts: sanitizeParts(raw.parts),
+    symmetries: sanitizeSymmetries(raw.symmetries),
     warp: warp && warp.amp > 0 ? warp : undefined,
+    assemblies,
     metalness: raw.metalness !== undefined ? num(raw.metalness, 0.15, 0, 1) : undefined,
     roughness: raw.roughness !== undefined ? num(raw.roughness, 0.55, 0, 1) : undefined,
   };
+}
+
+/** Total geometry ops across the static base and every assembly. */
+export function totalProgramOps(p: ShapeProgram): number {
+  return p.ops.length + (p.assemblies?.reduce((n, a) => n + a.ops.length, 0) ?? 0);
+}
+
+/**
+ * Bake assemblies into a flat static program (motion at t=0) — exact placement
+ * math (quaternion-composed rotations, uniform scale). Used by the raytracer
+ * preview and any consumer that can't animate. Op count is capped at the
+ * kernel budget; overflow drops trailing assembly ops (preview-only concern).
+ */
+export function flattenProgram(p: ShapeProgram): ShapeProgram {
+  if (!p.assemblies?.length) return p;
+  const ops: PrimOp[] = [...p.ops];
+  const q = new THREE.Quaternion();
+  const qOp = new THREE.Quaternion();
+  const e = new THREE.Euler();
+  const v = new THREE.Vector3();
+  for (const a of p.assemblies) {
+    const expanded = expandProgram({ label: a.name, ops: a.ops, parts: a.parts, symmetries: a.symmetries });
+    const s = a.place.scale ?? 1;
+    const pr = a.place.rot ?? [0, 0, 0];
+    q.setFromEuler(e.set((pr[0] * Math.PI) / 180, (pr[1] * Math.PI) / 180, (pr[2] * Math.PI) / 180));
+    for (const op of expanded.ops) {
+      if (ops.length >= 64) return { ...p, ops, assemblies: undefined };
+      v.set(op.pos[0] * s, op.pos[1] * s, op.pos[2] * s).applyQuaternion(q);
+      const oRot = op.rot ?? [0, 0, 0];
+      qOp.setFromEuler(e.set((oRot[0] * Math.PI) / 180, (oRot[1] * Math.PI) / 180, (oRot[2] * Math.PI) / 180));
+      qOp.premultiply(q);
+      e.setFromQuaternion(qOp);
+      ops.push({
+        ...op,
+        pos: [v.x + a.place.pos[0], v.y + a.place.pos[1], v.z + a.place.pos[2]],
+        rot: [(e.x * 180) / Math.PI, (e.y * 180) / Math.PI, (e.z * 180) / Math.PI],
+        r: op.r !== undefined ? op.r * s : undefined,
+        size: op.size ? [op.size[0] * s, op.size[1] * s, op.size[2] * s] : undefined,
+        R: op.R !== undefined ? op.R * s : undefined,
+        h: op.h !== undefined ? op.h * s : undefined,
+        blend: op.blend !== undefined ? op.blend * s : undefined,
+      });
+    }
+  }
+  return { ...p, ops, assemblies: undefined };
 }
 
 function sanitizeSymmetry(s: any): Symmetry | null {
@@ -642,6 +782,13 @@ OPTIONAL SYMMETRY DSL (top-level, expands repeated parts for you — use these t
     {"kind":"grid","of":"stud","nx":4,"nz":4,"dx":0.15,"dz":0.15}                  // lego-stud grid
   ]
 
+OPTIONAL ARTICULATED ASSEMBLIES (top-level "assemblies" — machines with moving parts):
+- An assembly is a named part with its own ops, authored FULL-SIZE in its own local frame with the pivot at the origin, then placed (and shrunk) into the model by "place", and optionally animated forever by "motion":
+  {"name":"second-hand","ops":[...],"place":{"pos":[0,0.09,0],"scale":0.45},"motion":{"kind":"spin","axis":"y","rpm":12},"metalness":0.9,"roughness":0.2}
+- motion kinds: {"kind":"spin","axis":"y","rpm":12} — gears/hands/wheels/propellers (meshing gears alternate rpm sign, |ratio| = tooth ratio); {"kind":"oscillate","axis":"z","deg":40,"freq":1} — pendulums, levers, rockers; {"kind":"piston","axis":"y","dist":0.35,"freq":1.5,"phase":1.57} — pistons/pumps (phase staggers the firing order: k*pi/2 for cylinder k).
+- The part moves about ITS OWN origin — author it centered on the pivot (a clock hand's shaft at [0,0,0] with the blade extending +x; a gear centered at [0,0,0]).
+- Static housing/chassis stays in the top-level "ops"; only moving or logically-separable parts become assemblies. A gear = hex or torus body + "radial" symmetry of box teeth.
+
 RULES:
 - Everything must fit inside [-1.2, 1.2] on every axis. Y is UP. Build 6-20 ops (or fewer ops + symmetries).
 - Think like a sculptor: big masses first, then details. Use "smooth" mode + blend to fuse parts.
@@ -651,6 +798,108 @@ RULES:
 EXAMPLE — "6-petaled flower with a stem": {"label":"flower","parts":[{"name":"petal","ops":[{"prim":"ellipsoid","mode":"union","color":"#e85a9b","pos":[0,0,0],"size":[0.35,0.05,0.18]}]}],"symmetries":[{"kind":"radial","of":"petal","count":6,"radius":0.18,"axis":"y","spin":true}],"ops":[{"prim":"capsule","mode":"union","color":"#3a8a3a","pos":[0,-0.7,0],"size":[0,0.9,0],"r":0.05},{"prim":"sphere","mode":"union","color":"#dcb35c","pos":[0,0.05,0],"r":0.12}]}
 
 Reply with ONLY the JSON object for this description:`;
+
+// ——— two-pass compose: plan (parts on the grid) → refine (per-part ops) ———
+// Process borrowed from the owner's AssetForge factory: a planner decomposes
+// the object into canonical parts with roles and motion BEFORE any geometry
+// is built, then each part is refined separately. Pass 1 is pure spatial
+// layout; pass 2 authors every part full-size in its local frame, so the
+// placement scale multiplies its effective polygonization resolution.
+
+const PLAN_INSTRUCTIONS = `You are the layout planner of a 3D model factory. Decompose the described object into 3-10 named parts positioned on a coordinate grid (Y is UP; the whole model fits in [-1.2,1.2] on every axis). Reply with ONLY a JSON object, no prose, no code fences:
+{"label":"short name","category":"vehicle|timepiece|engine|furniture|building|creature|handheld|other","metalness":0-1,"roughness":0-1,"parts":[
+  {"name":"kebab-name","role":"what this part is/does","pos":[x,y,z],"scale":0.1-1.0,"rot":[x,y,z] optional euler degrees,
+   "moving":{"kind":"spin","axis":"y","rpm":12} optional — see motion rules,
+   "hint":"one line describing the part's shape for the geometry pass","color":"#rrggbb","metalness":0-1 optional,"roughness":0-1 optional}]}
+
+DECOMPOSE LIKE A FACTORY PLANNER (canonical parts per category):
+- timepiece: case-ring, dial-face, hour-hand(spin y, slow), minute-hand(spin y, faster), second-hand(spin y, rpm 8-15 for visible demo), crown, 1-3 visible gears(spin, alternating sign)
+- engine: engine-block(static), crankshaft(spin z), pistons as SEPARATE parts (piston y, same freq, phase k*1.57 for cylinder k), flywheel(spin z, same rpm as crankshaft), pulleys/fan(spin)
+- vehicle: body-shell(static), 4 wheels as separate parts (spin x, same rpm), steering-wheel, lights/glass
+- windmill/fan/turbine: tower/housing(static), blade-rotor(spin, one assembly containing ALL blades via radial symmetry)
+- creature/humanoid: body masses head/torso/limbs (usually static here)
+- furniture/building/handheld: frame + functional sub-parts; doors/lids may oscillate about their hinge
+MOTION RULES: every mechanically-moving part MUST get "moving". Meshing gears alternate rpm sign with |ratio| = tooth ratio. Piston phase = k*1.57. Choose rpm 6-30 so motion is clearly visible. The pivot will be the part's local origin — position "pos" AT the pivot (wheel axle center, hand shaft, crank axis), not the part's visual center.
+SCALE RULE: "scale" is how much the full-size part shrinks into place — a watch hand might be scale 0.4, a wheel 0.3. Small parts get small scales; the assembled result must fit [-1.2,1.2].
+This is PASS 1 (layout only) — no geometry. Description:`;
+
+const REFINE_PART_INSTRUCTIONS = `PASS 2 — you are the geometry refiner of a 3D model factory. PASS 1 planned the parts below (positions/scales/motion are FIXED — do not restate them). For EACH planned part, author its SDF ops FULL-SIZE in the part's OWN local frame: pretend the part alone fills [-1.2,1.2] and its pivot (axle/shaft/hinge) is at the origin. Also author optional top-level "ops" for the static base ONLY if the plan lists no static parts.
+${''}Use the same primitive/CSG/symmetry language as the main compiler:
+- prims: sphere(r) box(size=half-extents) ellipsoid(size) capsule(pos→pos+size,r) torus(R,r) cone(r,h) hex(size=[radial,halfH,_]) octahedron(r)
+- modes: union | smooth(blend 0.06-0.15) | subtract | intersect — ops apply in order
+- "parts"+"symmetries" DSL per assembly: e.g. a gear = hex body + {"kind":"radial","of":"tooth","count":12,"radius":0.95,"axis":"y","spin":true} over a small box tooth
+Give each part 4-10 ops (hero parts up to 16). Realistic per-part colors; metals get metalness 0.7-0.95, roughness 0.15-0.4.
+Reply with ONLY JSON: {"assemblies":[{"name":"<exact planned name>","ops":[...],"parts":[...] optional,"symmetries":[...] optional,"metalness":opt,"roughness":opt}, ...one per planned part...], "ops":[...optional static base ops in WORLD frame...]}`;
+
+/**
+ * Two-pass compose for complex/mechanical objects. Falls back to null on any
+ * failure — the caller then tries the single-shot composeWithAI.
+ */
+export async function composeComplexWithAI(prompt: string): Promise<{ program: ShapeProgram; source: 'ai' } | null> {
+  try {
+    const plan = await aiChatSync(`${PLAN_INSTRUCTIONS} "${prompt}"`, 'sdf-shape-compiler-plan', 60000);
+    const planMatch = plan.text.match(/\{[\s\S]*\}/);
+    if (!planMatch) return null;
+    const rawPlan = JSON.parse(planMatch[0]);
+    const planned: any[] = Array.isArray(rawPlan?.parts) ? rawPlan.parts.slice(0, 12) : [];
+    if (planned.length < 2) return null;
+
+    const partList = planned.map((p: any) =>
+      `- name:"${String(p.name || '')}" role:"${String(p.role || '')}" shape-hint:"${String(p.hint || '')}" color:${p.color || '#7b8cfa'}${p.moving ? ` MOVING(${p.moving.kind} ${p.moving.axis})` : ' static'}`,
+    ).join('\n');
+    const refined = await aiChatSync(
+      `${REFINE_PART_INSTRUCTIONS}\n\nOBJECT: "${prompt}" (${String(rawPlan.label || '')}, category ${String(rawPlan.category || 'other')})\nPLANNED PARTS:\n${partList}`,
+      'sdf-shape-compiler-refine-pass',
+      90000,
+    );
+    const refMatch = refined.text.match(/\{[\s\S]*\}/);
+    if (!refMatch) return null;
+    const rawRefined = JSON.parse(refMatch[0]);
+    const refinedByName = new Map<string, any>(
+      (Array.isArray(rawRefined?.assemblies) ? rawRefined.assemblies : [])
+        .filter((a: any) => a && typeof a.name === 'string')
+        .map((a: any) => [a.name.toLowerCase().trim(), a]),
+    );
+
+    // Merge: plan owns placement + motion + material defaults; refine owns
+    // geometry. A part the refiner skipped gets a single hint-colored
+    // primitive so the layout never loses a planned part.
+    const assemblies = planned.map((p: any) => {
+      const r = refinedByName.get(String(p.name || '').toLowerCase().trim());
+      const fallbackOp = { prim: 'box', mode: 'union', color: p.color || '#7b8cfa', pos: [0, 0, 0], size: [0.6, 0.6, 0.6] };
+      return {
+        name: p.name,
+        ops: Array.isArray(r?.ops) && r.ops.length ? r.ops : [fallbackOp],
+        parts: r?.parts,
+        symmetries: r?.symmetries,
+        place: { pos: p.pos, rot: p.rot, scale: p.scale },
+        motion: p.moving,
+        metalness: r?.metalness ?? p.metalness,
+        roughness: r?.roughness ?? p.roughness,
+      };
+    });
+
+    const program = sanitizeProgram({
+      label: rawPlan.label || prompt.slice(0, 48),
+      ops: Array.isArray(rawRefined?.ops) ? rawRefined.ops : [],
+      assemblies,
+      metalness: rawPlan.metalness,
+      roughness: rawPlan.roughness,
+    }, prompt.slice(0, 48));
+    if (program && (program.assemblies?.length ?? 0) >= 2 && totalProgramOps(program) >= 4) {
+      return { program, source: 'ai' };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** Prompts that smell mechanical/composite get the two-pass factory treatment. */
+export function wantsComplexCompose(prompt: string): boolean {
+  return /\b(watch|clock|engine|gear|machine|motor|mechanis|robot|turbine|windmill|fan|drone|helicopter|car|truck|vehicle|piston|pump|mill|carousel|ferris|propeller|wheel|clockwork|mechanical)\b/i.test(prompt)
+    || prompt.trim().length > 80;
+}
 
 /**
  * Compose a shape program via the AI provider chain. Returns null when no
@@ -668,7 +917,7 @@ export async function composeWithAI(prompt: string): Promise<{ program: ShapePro
     const match = text.match(/\{[\s\S]*\}/);
     if (match) {
       const program = sanitizeProgram(JSON.parse(match[0]), prompt.slice(0, 48));
-      if (program && program.ops.length >= 2) return { program, source: 'ai' };
+      if (program && totalProgramOps(program) >= 2) return { program, source: 'ai' };
     }
   } catch { /* no provider answered */ }
   return null;
@@ -687,7 +936,7 @@ export async function refineProgramWithAI(current: ShapeProgram, instruction: st
     const match = text.match(/\{[\s\S]*\}/);
     if (!match) return null;
     const program = sanitizeProgram(JSON.parse(match[0]), current.label);
-    return program && program.ops.length >= 2 ? program : null;
+    return program && totalProgramOps(program) >= 2 ? program : null;
   } catch {
     return null;
   }
@@ -1171,6 +1420,205 @@ export function buildPreviewProgram(text: string): ShapeProgram | null {
         { prim: 'capsule', mode: 'union', color: '#4a2e18',  pos: [0, sc(-0.5), 0],        size: [0, sc(0.36), 0], r: sc(0.07) },
         // pommel
         { prim: 'sphere',  mode: 'union', color: '#a87820',  pos: [0, sc(-0.75), 0],       r: sc(0.1) },
+      ],
+    };
+  }
+
+  // ── wine glass / champagne glass / goblet ─────────────────────────────────
+  if (/wine.glass|champagne|goblet|chalice|glass/.test(t)) {
+    const glass = baseColor === '#7b8cfa' ? '#e8f4f8' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      metalness: 0.05, roughness: 0.08, // transparent glass material
+      ops: [
+        // bowl (upper sphere, carved hollow)
+        { prim: 'sphere',  mode: 'union',    color: glass, pos: [0, sc(0.42), 0],        r: sc(0.38) },
+        { prim: 'sphere',  mode: 'subtract', color: '#000', pos: [0, sc(0.48), 0],        r: sc(0.35) },
+        // bowl base transition (smooth into stem)
+        { prim: 'sphere',  mode: 'smooth', blend: 0.08, color: glass, pos: [0, sc(0.05), 0], r: sc(0.08) },
+        // stem (thin cylinder)
+        { prim: 'capsule', mode: 'union',    color: glass, pos: [0, sc(-0.18), 0],       size: [0, sc(0.48), 0], r: sc(0.03) },
+        // base foot (wide disc)
+        { prim: 'torus',   mode: 'union',    color: glass, pos: [0, sc(-0.72), 0],       R: sc(0.24), r: sc(0.08) },
+        // base center (fill torus hole)
+        { prim: 'sphere',  mode: 'union',    color: glass, pos: [0, sc(-0.72), 0],       r: sc(0.18) },
+      ],
+    };
+  }
+
+  // ── telescope / spyglass ──────────────────────────────────────────────────
+  if (/telescope|spyglass|scope|binoculars/.test(t)) {
+    const brass = baseColor === '#7b8cfa' ? '#b89030' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      metalness: Math.max(metalness, 0.65), roughness: 0.4,
+      ops: [
+        // main tube
+        { prim: 'capsule', mode: 'union', color: brass,      pos: [sc(-0.5), 0, 0],        size: [sc(0.95), 0, 0], r: sc(0.12) },
+        // eyepiece ring
+        { prim: 'torus',   mode: 'union', color: '#3a3a48',  pos: [sc(-0.55), 0, 0],       R: sc(0.14), r: sc(0.04) },
+        // objective lens housing
+        { prim: 'torus',   mode: 'union', color: '#3a3a48',  pos: [sc(0.52), 0, 0],        R: sc(0.18), r: sc(0.06) },
+        // lens (glass sphere inside)
+        { prim: 'sphere',  mode: 'union', color: '#88aacc',  pos: [sc(0.52), 0, 0],        r: sc(0.14) },
+        // tripod mount
+        { prim: 'box',     mode: 'union', color: '#3a3a48',  pos: [sc(-0.1), sc(-0.16), 0], size: [sc(0.08), sc(0.06), sc(0.08)] },
+      ],
+    };
+  }
+
+  // ── coffee mug / cup / teacup ─────────────────────────────────────────────
+  if (/\bmug\b|coffee.mug|\bcup\b|teacup/.test(t)) {
+    const ceramic = baseColor === '#7b8cfa' ? '#d8c8b0' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      roughness: Math.max(roughness, 0.6),
+      ops: [
+        // body (cylinder approximated with capsule + carved top)
+        { prim: 'capsule', mode: 'union', color: ceramic,    pos: [0, sc(-0.4), 0],        size: [0, sc(0.65), 0], r: sc(0.28) },
+        { prim: 'sphere',  mode: 'subtract', color: '#000',  pos: [0, sc(0.32), 0],        r: sc(0.24) },
+        // handle (torus segment)
+        { prim: 'torus',   mode: 'union', color: ceramic,    pos: [sc(0.32), sc(-0.08), 0], R: sc(0.22), r: sc(0.05) },
+        { prim: 'box',     mode: 'subtract', color: '#000',  pos: [sc(0.12), sc(-0.08), 0], size: [sc(0.2), sc(0.25), sc(0.08)] },
+        // base ring
+        { prim: 'torus',   mode: 'union', color: ceramic,    pos: [0, sc(-0.68), 0],       R: sc(0.24), r: sc(0.04) },
+      ],
+    };
+  }
+
+  // ── lighthouse / tower ────────────────────────────────────────────────────
+  if (/lighthouse|tower|beacon|minaret|obelisk/.test(t)) {
+    const stone = baseColor === '#7b8cfa' ? '#9a8a7a' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      roughness: Math.max(roughness, 0.75),
+      ops: [
+        // base platform
+        { prim: 'box',     mode: 'union', color: stone,      pos: [0, sc(-0.8), 0],        size: [sc(0.48), sc(0.08), sc(0.48)] },
+        // main tower shaft (tapered — cone base + cylinder top)
+        { prim: 'capsule', mode: 'union', color: stone,      pos: [0, sc(-0.65), 0],       size: [0, sc(1.15), 0], r: sc(0.22) },
+        { prim: 'capsule', mode: 'union', color: stone,      pos: [0, sc(0.52), 0],        size: [0, sc(0.18), 0], r: sc(0.26) },
+        // lantern room (glass)
+        { prim: 'box',     mode: 'union', color: '#e8e040',  pos: [0, sc(0.82), 0],        size: [sc(0.2), sc(0.12), sc(0.2)] },
+        // roof cap (cone)
+        { prim: 'cone',    mode: 'union', color: '#c03030',  pos: [0, sc(0.96), 0],        r: sc(0.28), h: sc(0.22) },
+        // windows (subtract slits)
+        { prim: 'box',     mode: 'subtract', color: '#000',  pos: [sc(0.24), sc(0.25), 0], size: [sc(0.06), sc(0.12), sc(0.06)] },
+        { prim: 'box',     mode: 'subtract', color: '#000',  pos: [sc(-0.24), sc(0.25), 0], size: [sc(0.06), sc(0.12), sc(0.06)] },
+      ],
+    };
+  }
+
+  // ── barrel / keg / cask ───────────────────────────────────────────────────
+  if (/barrel|\bkeg\b|cask|drum/.test(t)) {
+    const wood = baseColor === '#7b8cfa' ? '#8a5c30' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      roughness: Math.max(roughness, 0.7),
+      ops: [
+        // body (torus-like bulge — sphere carved top/bottom)
+        { prim: 'sphere',  mode: 'union', color: wood,       pos: [0, 0, 0],               r: sc(0.52) },
+        { prim: 'box',     mode: 'subtract', color: '#000',  pos: [0, sc(0.45), 0],        size: [sc(0.6), sc(0.2), sc(0.6)] },
+        { prim: 'box',     mode: 'subtract', color: '#000',  pos: [0, sc(-0.45), 0],       size: [sc(0.6), sc(0.2), sc(0.6)] },
+        // top metal ring
+        { prim: 'torus',   mode: 'union', color: '#3a3a48',  pos: [0, sc(0.32), 0],        R: sc(0.36), r: sc(0.04) },
+        // bottom metal ring
+        { prim: 'torus',   mode: 'union', color: '#3a3a48',  pos: [0, sc(-0.32), 0],       R: sc(0.36), r: sc(0.04) },
+        // middle metal band
+        { prim: 'torus',   mode: 'union', color: '#3a3a48',  pos: [0, 0, 0],               R: sc(0.42), r: sc(0.03) },
+      ],
+    };
+  }
+
+  // ── lamp / lantern / torch ────────────────────────────────────────────────
+  if (/\blamp\b|lantern|\btorch\b|candle/.test(t)) {
+    const brass = baseColor === '#7b8cfa' ? '#b89030' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      metalness: Math.max(metalness, 0.6), roughness: 0.45,
+      ops: [
+        // base stand
+        { prim: 'torus',   mode: 'union', color: brass,      pos: [0, sc(-0.72), 0],       R: sc(0.22), r: sc(0.05) },
+        { prim: 'capsule', mode: 'union', color: brass,      pos: [0, sc(-0.65), 0],       size: [0, sc(0.1), 0], r: sc(0.06) },
+        // pole
+        { prim: 'capsule', mode: 'union', color: brass,      pos: [0, sc(-0.25), 0],       size: [0, sc(0.7), 0], r: sc(0.04) },
+        // lantern housing (box frame)
+        { prim: 'box',     mode: 'union', color: brass,      pos: [0, sc(0.52), 0],        size: [sc(0.22), sc(0.28), sc(0.22)] },
+        // glass panes (lighter color inside frame)
+        { prim: 'box',     mode: 'union', color: '#e8e0a0',  pos: [0, sc(0.52), 0],        size: [sc(0.18), sc(0.24), sc(0.18)] },
+        // flame glow
+        { prim: 'sphere',  mode: 'union', color: '#ff8820',  pos: [0, sc(0.58), 0],        r: sc(0.08) },
+        // top cap (cone)
+        { prim: 'cone',    mode: 'union', color: brass,      pos: [0, sc(0.82), 0],        r: sc(0.2), h: sc(0.18) },
+      ],
+    };
+  }
+
+  // ── bell / church bell ────────────────────────────────────────────────────
+  if (/\bbell\b|church.bell|chime/.test(t)) {
+    const bronze = baseColor === '#7b8cfa' ? '#b87848' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      metalness: Math.max(metalness, 0.75), roughness: 0.4,
+      ops: [
+        // crown (top mounting piece)
+        { prim: 'box',     mode: 'union', color: bronze,     pos: [0, sc(0.68), 0],        size: [sc(0.12), sc(0.08), sc(0.12)] },
+        { prim: 'torus',   mode: 'union', color: bronze,     pos: [0, sc(0.72), 0],        R: sc(0.08), r: sc(0.04) },
+        // bell body (inverted cone shape — sphere carved)
+        { prim: 'sphere',  mode: 'union', color: bronze,     pos: [0, sc(0.15), 0],        r: sc(0.58) },
+        { prim: 'sphere',  mode: 'subtract', color: '#000',  pos: [0, sc(0.22), 0],        r: sc(0.52) },
+        { prim: 'box',     mode: 'subtract', color: '#000',  pos: [0, sc(0.75), 0],        size: [sc(0.7), sc(0.2), sc(0.7)] },
+        // sound bow (bottom rim thickening)
+        { prim: 'torus',   mode: 'union', color: bronze,     pos: [0, sc(-0.38), 0],       R: sc(0.48), r: sc(0.06) },
+        // clapper (hanging inside)
+        { prim: 'sphere',  mode: 'union', color: '#3a3a48',  pos: [0, sc(-0.5), 0],        r: sc(0.08) },
+      ],
+    };
+  }
+
+  // ── axe / hatchet / battle axe ────────────────────────────────────────────
+  if (/\baxe\b|hatchet|battle.axe|tomahawk/.test(t)) {
+    const metal = baseColor === '#7b8cfa' ? '#c0c8d0' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      metalness: Math.max(metalness, 0.8), roughness: 0.35,
+      ops: [
+        // handle/haft
+        { prim: 'capsule', mode: 'union', color: '#6a4a2a',  pos: [0, sc(-0.45), 0],       size: [0, sc(0.85), 0], r: sc(0.06) },
+        // axe head body (box rotated)
+        { prim: 'box',     mode: 'union', color: metal,      pos: [0, sc(0.52), 0],        size: [sc(0.08), sc(0.18), sc(0.45)] },
+        // blade wedge (front)
+        { prim: 'box',     mode: 'union', color: metal,      pos: [sc(0.12), sc(0.52), 0], rot: [0, 0, 25], size: [sc(0.08), sc(0.16), sc(0.42)] },
+        // blade wedge (back)
+        { prim: 'box',     mode: 'union', color: metal,      pos: [sc(-0.12), sc(0.52), 0], rot: [0, 0, -25], size: [sc(0.08), sc(0.16), sc(0.42)] },
+        // pommel (end cap)
+        { prim: 'sphere',  mode: 'union', color: '#6a4a2a',  pos: [0, sc(-0.95), 0],       r: sc(0.08) },
+      ],
+    };
+  }
+
+  // ── campfire / bonfire ────────────────────────────────────────────────────
+  if (/campfire|bonfire|fire.pit/.test(t)) {
+    const wood = baseColor === '#7b8cfa' ? '#5a3a1a' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      roughness: 0.8,
+      parts: [
+        { name: 'log', ops: [
+          { prim: 'capsule', mode: 'union', color: wood, pos: [0, 0, 0], size: [sc(0.5), 0, 0], r: sc(0.08) },
+        ]},
+      ],
+      symmetries: [
+        { kind: 'radial', of: 'log', count: 6, radius: sc(0.15), axis: 'y', spin: false },
+      ],
+      ops: [
+        // fire (orange/yellow spheres stacked)
+        { prim: 'sphere',  mode: 'union', color: '#ff6030',  pos: [0, sc(-0.1), 0],        r: sc(0.2) },
+        { prim: 'sphere',  mode: 'union', color: '#ff9020',  pos: [0, sc(0.08), 0],        r: sc(0.16) },
+        { prim: 'sphere',  mode: 'union', color: '#ffcc30',  pos: [0, sc(0.22), 0],        r: sc(0.12) },
+        // rocks around base
+        { prim: 'sphere',  mode: 'union', color: '#6a6a70',  pos: [sc(0.32), sc(-0.35), sc(0.2)],   r: sc(0.12) },
+        { prim: 'sphere',  mode: 'union', color: '#6a6a70',  pos: [sc(-0.28), sc(-0.35), sc(-0.25)], r: sc(0.1) },
       ],
     };
   }

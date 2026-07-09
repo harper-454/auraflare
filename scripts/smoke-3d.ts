@@ -11,9 +11,12 @@
  */
 import {
   compileProgram, evaluateFieldCPU, expandProgram,
-  sanitizeProgram, BOUND, type ShapeProgram, type PrimKind,
+  sanitizeProgram, flattenProgram, totalProgramOps, BOUND,
+  type ShapeProgram, type PrimKind,
 } from '../src/lib/sdf-compiler';
 import { packOps, PRIM_ID } from '../src/lib/sdf-gpu';
+import { buildAnimationClips, applyAnimators, type Animator } from '../src/lib/sdf-assembly';
+import * as THREE from 'three';
 
 // Fixture programs (the former UI presets — cut from the product, kept here
 // because together they exercise every primitive, smooth blends, subtract,
@@ -214,6 +217,64 @@ ok(clean!.ops.length === 3 && clean!.ops.map(o => o.prim).join(',') === 'octahed
 ok(!!clean!.warp && clean!.warp.amp === 0.05, 'warp survives');
 ok(!!clean!.symmetries && clean!.symmetries.length === 1, 'radial symmetry survives');
 ok(gpuEligible(clean!), 'sanitized gem tower is GPU-eligible');
+
+// ── 6. Articulated assemblies — sanitize, flatten, animate, bake clips ──
+console.log('\n[6] Assemblies (moving parts)');
+const rawWatch = {
+  label: 'test watch',
+  ops: [{ prim: 'hex', mode: 'union', color: '#c0c4cc', pos: [0, 0, 0], size: [0.9, 0.1, 0.9] }],
+  assemblies: [
+    {
+      name: 'Second Hand!',
+      ops: [{ prim: 'box', mode: 'union', color: '#d94040', pos: [0.5, 0, 0], size: [0.5, 0.03, 0.03] }],
+      place: { pos: [0, 0.12, 0], scale: 0.8 },
+      motion: { kind: 'spin', axis: 'y', rpm: 12 },
+    },
+    {
+      name: 'gear-a',
+      ops: [{ prim: 'hex', mode: 'union', color: '#dcb35c', pos: [0, 0, 0], size: [0.8, 0.15, 0.8] }],
+      parts: [{ name: 'tooth', ops: [{ prim: 'box', mode: 'union', color: '#dcb35c', pos: [0, 0, 0], size: [0.12, 0.12, 0.08] }] }],
+      symmetries: [{ kind: 'radial', of: 'tooth', count: 8, radius: 0.9, axis: 'y', spin: true }],
+      place: { pos: [0.4, -0.2, 0.3], rot: [90, 0, 0], scale: 0.25 },
+      motion: { kind: 'spin', axis: 'y', rpm: -24 },
+      metalness: 0.85,
+    },
+    {
+      name: 'piston-1',
+      ops: [{ prim: 'capsule', mode: 'union', color: '#8b94a7', pos: [0, -0.4, 0], size: [0, 0.8, 0], r: 0.25 }],
+      place: { pos: [-0.5, 0.2, -0.3], scale: 0.3 },
+      motion: { kind: 'piston', axis: 'y', dist: 0.4, freq: 2, phase: 1.57 },
+    },
+  ],
+};
+const watch = sanitizeProgram(rawWatch, 'fallback');
+ok(!!watch && (watch.assemblies?.length ?? 0) === 3, `sanitize keeps 3 assemblies (name slugged: "${watch?.assemblies?.[0].name}")`);
+ok(watch!.assemblies![0].name === 'second-hand', 'assembly names are slugged unique');
+ok(watch!.assemblies![1].motion?.kind === 'spin' && watch!.assemblies![1].motion?.rpm === -24, 'negative rpm (meshing gear) survives');
+ok(totalProgramOps(watch!) === 4, `totalProgramOps counts base + assemblies (${totalProgramOps(watch!)})`);
+
+const flat = flattenProgram(watch!);
+ok(!flat.assemblies && flat.ops.length >= 4, `flatten bakes assemblies to ${flat.ops.length} static ops`);
+const gearOps = flat.ops.filter(o => o.color === '#dcb35c');
+ok(gearOps.length === 9, `radial gear teeth expanded + placed (${gearOps.length} ops)`);
+ok(gearOps.every(o => o.pos.every(v => Math.abs(v) <= BOUND + EPS)), 'flattened gear stays in bounds');
+const flatMesh = compileProgram(flat, 40);
+ok(flatMesh.triangles > 100, `flattened watch polygonizes: ${flatMesh.triangles} tris`);
+
+// Animator math: spin + piston posed at t, clips bake from the same math.
+const spinObj = new THREE.Group(); spinObj.name = 'asm_second-hand';
+const pistObj = new THREE.Group(); pistObj.name = 'asm_piston-1';
+const anims: Animator[] = [
+  { object: spinObj, motion: watch!.assemblies![0].motion!, basePos: spinObj.position.clone() },
+  { object: pistObj, motion: watch!.assemblies![2].motion!, basePos: pistObj.position.clone() },
+];
+applyAnimators(anims, 1.25); // 12 rpm → 90° at t=1.25s
+ok(Math.abs(spinObj.rotation.y - Math.PI / 2) < 1e-6, `spin pose exact: 90° at 1.25 s (got ${(spinObj.rotation.y * 180 / Math.PI).toFixed(2)}°)`);
+ok(Math.abs(pistObj.position.y - 0.4 * Math.sin(2 * Math.PI * 2 * 1.25 + 1.57)) < 1e-6, 'piston pose follows its sine');
+const clips = buildAnimationClips(anims);
+ok(clips.length === 1 && clips[0].tracks.length === 2, `one clip, ${clips[0]?.tracks.length} tracks`);
+ok(clips[0].tracks[0].name === 'asm_second-hand.quaternion' && clips[0].tracks[1].name === 'asm_piston-1.position', 'track names target the motion groups');
+ok(clips[0].duration >= 4.9, `clip covers the slowest period (${clips[0].duration.toFixed(1)} s)`);
 
 console.log(`\n${failures === 0 ? '✅ ALL 3D SMOKE TESTS PASSED' : `❌ ${failures} FAILURE(S)`}`);
 process.exit(failures === 0 ? 0 : 1);
