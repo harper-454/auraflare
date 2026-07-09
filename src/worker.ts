@@ -39,24 +39,36 @@ const json = (data: unknown, status = 200) =>
 // Inference helpers (shared by sync + workflow paths)
 // ───────────────────────────────────────────────────────────────────────────
 
+// Fast non-reasoning instruct model for structured JSON tasks (3D shape
+// compose/refine, prompt parsing). The default WORKERS_AI_MODEL (kimi-k2.6) is
+// a reasoning model: on these tasks its chain-of-thought either exhausted
+// max_tokens (empty answer) or blew the platform timeout ("3046: Request
+// timeout" after ~4 min). Verified in the catalog 2026-07-08.
+const FAST_STRUCTURED_MODEL = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+
 async function runInference(
   env: Env,
   prompt: string,
-  opts: { cacheTtl?: number; metadata?: Record<string, string>; messages?: any[] } = {},
+  opts: { cacheTtl?: number; metadata?: Record<string, string>; messages?: any[]; model?: string } = {},
 ): Promise<{ text: string; model: string; cached: boolean; latencyMs: number }> {
   const started = Date.now();
-  const cacheKey = `ai:${await sha256(prompt)}`;
+  const model = opts.model || env.WORKERS_AI_MODEL;
+  const cacheKey = `ai:${await sha256(`${model}:${prompt}`)}`;
   if (opts.cacheTtl) {
     const hit = await env.KV.get(cacheKey);
     if (hit) return { text: hit, model: 'kv-cache', cached: true, latencyMs: Date.now() - started };
   }
 
+  // 8192: kimi-k2.6 is a reasoning model — its chain-of-thought spends from the
+  // same budget as the answer. At 2048 a complex request (e.g. composing a 3D
+  // shape program) exhausted the cap inside reasoning_content and returned an
+  // EMPTY message.content, which then got cached. Simple chats are unaffected.
   const isChatModel = !!opts.messages;
   const result: any = await env.AI.run(
-    env.WORKERS_AI_MODEL as Parameters<Ai['run']>[0],
+    model as Parameters<Ai['run']>[0],
     isChatModel
-      ? { messages: opts.messages, max_tokens: 2048 }
-      : { messages: [{ role: 'user', content: prompt }], max_tokens: 2048 },
+      ? { messages: opts.messages, max_tokens: 8192 }
+      : { messages: [{ role: 'user', content: prompt }], max_tokens: 8192 },
     {
       gateway: {
         id: env.AI_GATEWAY_ID,
@@ -75,20 +87,23 @@ async function runInference(
   // Try each in turn so we always persist the actual answer text, not the envelope.
   const extractText = (r: any): string => {
     if (typeof r?.response === 'string' && r.response) return r.response;
-    if (typeof r?.message?.content === 'string') return r.message.content;
+    if (typeof r?.message?.content === 'string' && r.message.content) return r.message.content;
     if (Array.isArray(r?.choices) && r.choices.length > 0) {
       const c = r.choices[0];
-      if (typeof c?.message?.content === 'string') return c.message.content;
-      if (typeof c?.text === 'string') return c.text;
+      if (typeof c?.message?.content === 'string' && c.message.content) return c.message.content;
+      if (typeof c?.text === 'string' && c.text) return c.text;
     }
     if (typeof r === 'string') return r;
     return JSON.stringify(r);
   };
   const text = extractText(result);
+  // An empty answer is a failure, not a result — surface it (callers have
+  // fallbacks) and never cache it, or every identical retry inherits the blank.
+  if (!text.trim() || text === '{}') throw new Error('model returned an empty response');
   if (opts.cacheTtl) {
     await env.KV.put(cacheKey, text, { expirationTtl: Math.max(60, opts.cacheTtl) });
   }
-  return { text, model: env.WORKERS_AI_MODEL, cached: false, latencyMs: Date.now() - started };
+  return { text, model, cached: false, latencyMs: Date.now() - started };
 }
 
 async function sha256(s: string): Promise<string> {
@@ -113,7 +128,13 @@ async function logAi(env: Env, endpoint: string, model: string, cached: boolean,
 // history at any time.
 // ───────────────────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `You are Aura, the AI engineering partner in the AuraFlare platform. You help users design systems, write code, and reason about architecture. Be concrete and practical. When you produce code, use fenced code blocks with the language tag. You are running in a durable workflow — you can take multiple turns to fully address a request.`;
+const SYSTEM_PROMPT = `You are Aura, the creation engine inside AuraFlare. The promise of this product: if someone can think it, you can create it. You produce complete, professional-grade artifacts, not sketches:
+- Software: full working code in fenced blocks with language tags; single-file browser prototypes when asked for games or interactive apps.
+- Research papers: rigorous structure (abstract → methodology → findings → limitations); clearly separate established fact from open questions; never fabricate citations.
+- Enterprise/regulatory apps: map requirements to the actual governing regulations, specify audit trails, data handling, and access models before code.
+- Plans and specs: exhaustive, decision-ready — requirements matrices, risk registers, phased roadmaps with definitions of done.
+- Podcasts/scripts/creative: publish-ready, with structure (segments, timestamps, show notes) not just prose.
+Be concrete and practical; state assumptions instead of asking trivial questions. You run in a durable workflow — you may take multiple turns to fully finish something ambitious, and the user may close their browser while you work. Use your turns to deliver the complete artifact.`;
 
 const MAX_TURNS = 6;
 
@@ -312,9 +333,20 @@ export default {
     // ── Legacy / fallback sync AI endpoints (kept for FloatingAssistant + 3D compose) ──
     if (request.method === 'POST' && pathname === '/api/chat-sync') {
       const { message, context } = await request.json<{ message: string; context?: string }>();
-      const prompt = `You are a helpful context-aware assistant for the Aura Engine Specification platform. The user is viewing the "${context ?? 'unknown'}" section. Answer clearly and concisely.\n\nUser query: ${message}`;
+      // Structured contexts (3D compose/refine, prompt parsing) carry their own
+      // complete instructions and demand JSON-only replies — send them verbatim
+      // to the fast instruct model instead of wrapping them in assistant
+      // framing and feeding them to the slow reasoning default.
+      const structured = /^(sdf-shape-compiler|3d-generator)/.test(context ?? '');
+      const prompt = structured
+        ? message
+        : `You are a helpful context-aware assistant for the Aura Engine Specification platform. The user is viewing the "${context ?? 'unknown'}" section. Answer clearly and concisely.\n\nUser query: ${message}`;
       try {
-        const r = await runInference(env, prompt, { cacheTtl: 300, metadata: { endpoint: 'chat', section: context ?? '' } });
+        const r = await runInference(env, prompt, {
+          cacheTtl: 300,
+          model: structured ? FAST_STRUCTURED_MODEL : undefined,
+          metadata: { endpoint: 'chat', section: context ?? '' },
+        });
         ctx.waitUntil(logAi(env, 'chat', r.model, r.cached, r.latencyMs));
         return json({ text: r.text, model: r.model, cached: r.cached });
       } catch (e: any) {
@@ -371,6 +403,139 @@ export default {
         'SELECT endpoint, COUNT(*) as calls, AVG(latency_ms) as avg_ms, SUM(cached) as cache_hits FROM ai_log GROUP BY endpoint ORDER BY calls DESC',
       ).all();
       return json({ stats: results });
+    }
+
+    // ── Real image generation: SDXL-Lightning on Workers AI → R2 ──
+    // Free under the Workers AI allocation. Uses the JSON-input model so the
+    // request flows through the (default) AI Gateway like every other call and
+    // returns a ReadableStream of JPEG bytes we pipe straight into R2.
+    //
+    // Why not FLUX.2 [klein]? It's a *multipart-input* model, and Workers AI on
+    // this account routes through the AI Gateway data plane, which cannot yet
+    // stream a multipart request body ("AI Gateway does not support
+    // ReadableStreams yet") — and a buffered multipart body is rejected with
+    // "8001: Invalid input". Both dead-end today. Cloudflare's own docs note a
+    // fix is in flight ("we're pushing a change to address this soon"); once it
+    // lands, swap the model id back to '@cf/black-forest-labs/flux-2-klein-4b'
+    // with the multipart form body. SDXL-Lightning ships a real feature now.
+    if (pathname === '/api/media/generate' && request.method === 'POST') {
+      const { prompt, kind } = await request.json<{ prompt?: string; kind?: string }>()
+        .catch(() => ({} as { prompt?: string; kind?: string }));
+      if (!prompt || !prompt.trim()) return json({ error: 'prompt required' }, 400);
+      const started = Date.now();
+      // kind:'texture' → the same proven SDXL-Lightning path, but prompted for a
+      // seamless top-down material scan (for triplanar projection onto SDF
+      // meshes, which have no UVs) and stored under tex/ so the gallery can
+      // tell materials from pictures.
+      const isTexture = kind === 'texture';
+      const fullPrompt = isTexture
+        ? `seamless tileable texture of ${prompt.slice(0, 1024)}, top-down flat surface material, even diffuse lighting, no shadows, no objects, no borders, photographic material scan, high detail`
+        : prompt.slice(0, 2048);
+      try {
+        const img: any = await env.AI.run(
+          '@cf/bytedance/stable-diffusion-xl-lightning' as Parameters<Ai['run']>[0],
+          { prompt: fullPrompt, width: 1024, height: 1024 } as never,
+          { gateway: { id: env.AI_GATEWAY_ID, metadata: { endpoint: isTexture ? 'texture-gen' : 'image-gen' } } } as never,
+        );
+        let body: ArrayBuffer | null = null;
+        if (img instanceof ReadableStream) {
+          // R2.put rejects an unbounded stream ("must have a known length"), so
+          // buffer the image bytes before storing.
+          body = await new Response(img).arrayBuffer();
+        } else if (img && typeof img.image === 'string') {
+          // some image models return { image: <base64> }
+          const bin = Uint8Array.from(atob(img.image), c => c.charCodeAt(0));
+          body = bin.buffer as ArrayBuffer;
+        }
+        if (!body || body.byteLength === 0) return json({ error: 'unexpected image model response shape' }, 502);
+        const slug = prompt.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'image';
+        const key = `${isTexture ? 'tex' : 'gen'}/${Date.now()}-${slug}.jpg`;
+        await env.BUCKET.put(key, body as any, { httpMetadata: { contentType: 'image/jpeg' } });
+        ctx.waitUntil(logAi(env, isTexture ? 'texture-gen' : 'image-gen', 'sdxl-lightning', false, Date.now() - started));
+        return json({ ok: true, key, url: `/api/media/${encodeURIComponent(key)}` });
+      } catch (e: any) {
+        return json({ error: e.message }, 502);
+      }
+    }
+
+    // ── BYO-provider relay: OpenAI-compatible hosts that block browser CORS ──
+    // The client's provider chain tries the provider directly from the browser
+    // first; on a network-level (CORS) failure it retries through here with the
+    // user's own key. https-only — never a path to internal services.
+    if (pathname === '/api/providers/relay' && request.method === 'POST') {
+      const { baseUrl, apiKey, model, message } = await request.json<{ baseUrl?: string; apiKey?: string; model?: string; message?: string }>()
+        .catch(() => ({} as { baseUrl?: string; apiKey?: string; model?: string; message?: string }));
+      if (typeof baseUrl !== 'string' || !baseUrl.startsWith('https://')) return json({ error: 'baseUrl must be https://' }, 400);
+      if (!model || !message) return json({ error: 'model and message required' }, 400);
+      const started = Date.now();
+      try {
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+        const upstream = await fetch(`${baseUrl.replace(/\/$/, '')}/chat/completions`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ model, messages: [{ role: 'user', content: String(message) }] }),
+        });
+        const data: any = await upstream.json().catch(() => ({}));
+        if (!upstream.ok) return json({ error: data?.error?.message || data?.error || `upstream ${upstream.status}` }, 502);
+        const text = String(data?.choices?.[0]?.message?.content ?? '');
+        if (!text.trim()) return json({ error: 'empty reply from provider' }, 502);
+        ctx.waitUntil(logAi(env, 'provider-relay', String(model), false, Date.now() - started));
+        return json({ text });
+      } catch (e: any) {
+        return json({ error: e.message }, 502);
+      }
+    }
+
+    // ── Vision caption: photo → structured description for the 3D composer ──
+    // Powers "upload a photo → generate a model": the client sends a downscaled
+    // JPEG as base64, a Workers AI VLM describes the object, and the client
+    // feeds that description to the SDF shape composer while using the photo
+    // itself as the triplanar albedo. Models are tried in order so the endpoint
+    // keeps working whichever VLM the account's catalog carries.
+    if (pathname === '/api/media/describe' && request.method === 'POST') {
+      const { image, prompt } = await request.json<{ image?: string; prompt?: string }>()
+        .catch(() => ({} as { image?: string; prompt?: string }));
+      if (!image) return json({ error: 'image (base64) required' }, 400);
+      const b64 = image.includes(',') ? image.slice(image.indexOf(',') + 1) : image;
+      let bytes: Uint8Array;
+      try {
+        bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+      } catch {
+        return json({ error: 'invalid base64 image' }, 400);
+      }
+      if (bytes.byteLength > 4 * 1024 * 1024) return json({ error: 'image too large (max 4 MB — downscale client-side)' }, 413);
+      const question = prompt?.trim()
+        || 'Describe the main object in this photo for a 3D modeler: overall shape, its distinct parts and how they are arranged, approximate colors, and the surface material. 3-5 concise sentences. Ignore the background.';
+      const started = Date.now();
+      // Catalog verified 2026-07-08: llama-3.2-11b-vision is the current best
+      // VLM (answers in `response`), llava is Beta (answers in `description`),
+      // uform is deprecated — kept only as a last resort. All three accept
+      // { image: number[], prompt, max_tokens }.
+      const VLM_MODELS = [
+        '@cf/meta/llama-3.2-11b-vision-instruct',
+        '@cf/llava-hf/llava-1.5-7b-hf',
+        '@cf/unum/uform-gen2-qwen-500m',
+      ];
+      let lastErr = 'no vision model available';
+      for (const model of VLM_MODELS) {
+        try {
+          const out: any = await env.AI.run(
+            model as Parameters<Ai['run']>[0],
+            { image: Array.from(bytes), prompt: question, max_tokens: 512 } as never,
+            { gateway: { id: env.AI_GATEWAY_ID, metadata: { endpoint: 'vision-describe' } } } as never,
+          );
+          const description = String(out?.description ?? out?.text ?? out?.response ?? '').trim();
+          if (description) {
+            ctx.waitUntil(logAi(env, 'vision-describe', model, false, Date.now() - started));
+            return json({ ok: true, description, model });
+          }
+          lastErr = `empty description from ${model}`;
+        } catch (e: any) {
+          lastErr = e.message;
+        }
+      }
+      return json({ error: lastErr }, 502);
     }
 
     // ── R2 media gallery ──
