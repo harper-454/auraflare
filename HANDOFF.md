@@ -1,7 +1,25 @@
 # AuraFlare — Handoff Notes
 
-**Last updated:** 2026-07-05
-**Status:** Production live at https://aura.massivenumber.com (matches local).
+**Last updated:** 2026-07-08 (third pass)
+**Status:** Production live at https://aura.massivenumber.com — deployed ae7ab28e. Working tree uncommitted; owner should review + commit.
+
+---
+
+## What changed in the 2026-07-08 third pass (Claude) — BYO providers + non-preset gen verified live
+
+**Custom AI provider system** (owner directive: no hardcoded vendors). `src/lib/ai-providers.ts` reworked around a user-managed provider list, tried in order, each one of three wire formats: `gemini` (Google REST), `openai` (any OpenAI-compatible endpoint), `anthropic` (Claude Messages API with the browser-CORS opt-in header). Settings → AI has templates for Google Gemini, ChatGPT, Claude, Openference, **Ollama + LM Studio (local LLMs)**, plus fully Custom. Chain: **Google sign-in (Gemini OAuth) first** → user providers top-to-bottom → **AuraFlare Cloud** (built-in Workers AI default — llama-3.3-70b-fast for structured 3D tasks, kimi-k2.6 for chat; "our own model" until we train one, which stays on the roadmap). Old v1 config auto-migrates.
+
+**CORS relay for hosted providers.** Openference (and some hosts) block browser-origin POSTs. New `POST /api/providers/relay` (worker + dev server, https-only) — the client tries the provider direct, and on a network-level failure retries through the relay with the user's key. **Verified in the browser: the owner's Openference key (GLM-5.2) composed "a medieval castle with four corner towers" → 22-op program → GPU @144³ → 140,650 tris**; network log shows direct-blocked → relay 200. Also verified: "a colorful hot air balloon" → source=ai via AuraFlare Cloud, 218k tris @144³ in 1.15 s.
+
+**Model-quality fixes that made non-preset generation reliable:** (a) kimi-k2.6 (reasoning) either burned `max_tokens: 2048` inside its chain-of-thought and returned an **empty** `content` — which then got **cached** — or at 8192 blew the platform timeout (`3046: Request timeout`, ~4 min). `runInference` now takes a per-call model; `/api/chat-sync` routes structured contexts (`sdf-shape-compiler*`, `3d-generator`) to `@cf/meta/llama-3.3-70b-instruct-fp8-fast` verbatim (no assistant wrapper), keeps kimi for chat; `max_tokens` 8192; **empty replies now throw and are never cached** (KV key includes the model). (b) Dev `/api/chat-sync` falls back to proxying production when Gemini fails (the dev Gemini key is out of prepaid credits — Google 429 RESOURCE_EXHAUSTED — top up at ai.studio to restore local Gemini). (c) Compose/refine client timeout 20 s → 60 s. (d) Dev `PUT /api/spec` no-op (was 404 noise).
+
+**Silent workspace restore** — the "Unsaved Session Found" banner is gone (App.tsx); autosaved state now restores unconditionally on load (it was already realtime-autosaved to localStorage + D1-mirrored).
+
+**Also in this tree (built by a parallel session, verified here):** MASTERPLAN 3D-2 — `SDFRaytracer.tsx` + `sdf-glsl.ts` live sphere-traced preview while typing (PREVIEWING state), and `buildPreviewProgram` (deterministic keyword composer) with `scripts/test-10models.ts` — 10/10 novel prompts pass offline.
+
+**Presets removed (owner: "the ones you have are junk").** The six hand-authored preset programs, their keyword fallback in `composeWithAI`, the PRESETS button row, AND the old humanoid/animal/mechanical placeholder rigs are gone from the product. Every model is now composed — by the AI provider chain, or offline by `buildPreviewProgram`'s heuristics (now also the offline fallback inside Generate, ahead of the parametric last resort). The idle viewport is just the grid until you type. The former presets survive only as polygonizer fixtures inside `scripts/smoke-3d.ts` (they exercise every primitive/mode/symmetry).
+
+**Known follow-ups:** the SDFRaytracer remounts spam a harmless `PCFSoftShadowMap deprecated` warning every frame-ish — worth a once-only guard; HUD could show *which* provider composed a mesh (chain already returns it); Anthropic/OpenAI/Gemini templates not yet exercised with real keys; component-internal copy for the 4 renamed sections still pending.
 
 This document is the map for the next operator. It captures what the app
 actually is, what changed in the 2026-07-05 production-real pass, and what's
@@ -16,6 +34,58 @@ The app is a **Vite + React + TypeScript SPA** with two runtimes:
 - **Production edge** — `src/worker.ts` (Cloudflare Worker). Serves the SPA via Static Assets; AI routes go through Workers AI + AI Gateway with KV cache + D1 telemetry log. `/api/fs` and `/api/exec` return 501 by design (no shell in Workers).
 
 The **MVP** is the **NCP Chat** (`src/components/NaturalConversationProgramming.tsx`) — natural-language → code, rendered with copyable code blocks. The **3D Viewport** is the secondary flagship: prompt → LLM-composed SDF shape program → WebGPU/CPU mesh → real `.glb` export.
+
+---
+
+## What changed in the 2026-07-08 second pass (Claude) — textures + photo→3D + detail
+
+Owner directive: texture generation in the 3D Studio, much higher model detail, and "upload a photo → model + texture from it" — free-first, borrowing what commercial apps (Meshy/Tripo) do. A 6-agent research workflow was launched twice and died/was cancelled on the monthly spend limit, so this was implemented inline from first principles. **Verified end-to-end:** both typechecks clean, `smoke:3d` all green, browser check (3D Studio renders; crystal preset generates 125,120 tris @144³ — exactly the expected 1.65× of the old 73.6k @112³; the triplanar shader compiles with zero GLSL errors and visibly samples a test texture), deployed **7c7df50f**, and live on production: texture-gen returned a real 1024² JPEG into R2 `tex/`, and `/api/media/describe` returned a coherent description. Two operational notes: (a) the describe fallback chain worked as designed — the `llama-3.2-11b-vision-instruct` first slot did not produce on this account and **llava-1.5-7b-hf answered**; investigate llama-3.2's input contract (it may want the `messages` format) if you want the stronger model. (b) **The dev-machine Gemini key is out of prepaid credits** (Google returns 429 RESOURCE_EXHAUSTED) — all local-dev AI (chat, compose, refine, dev describe) is dead until topped up at ai.studio; production is unaffected (Workers AI).
+
+**Texture generation (UV-less meshes, solved with triplanar projection).** SDF marching-tets meshes have no UVs, so classic texturing is impossible; the standard answer for procedural geometry is triplanar projection, now implemented in the new shared material module **`src/lib/sdf-material.ts`**: `makeSDFMaterial` (the base both backends now use — the previously-duplicated inline materials at `sdf-compiler.ts:517` and `sdf-gpu.ts:528` route through it) and `makeTriplanarMaterial`/`applyTriplanarToGroup` (MeshStandardMaterial + `onBeforeCompile` — world-space albedo sampled per-axis, normal-weight blended, tinted by the per-vertex part colors so a textured snowman keeps its orange nose; `customProgramCacheKey` set so three.js doesn't cross-wire shader programs). **Export caveat:** glTF has no triplanar shader, so `.glb` export (done pre-texturing) carries vertex colors; xatlas-web UV-unwrap + bake is the known follow-up for textured export.
+
+**Texture backend.** `/api/media/generate` now takes `kind: 'texture'`: same proven SDXL-Lightning JSON path, but wrapped in a seamless-material-scan prompt and stored under `tex/` in R2 (logged as `texture-gen`). The 3D Studio gained a Texture bar (fuchsia, appears once a mesh exists): blank input auto-derives the material prompt from the model's label.
+
+**Photo → model + texture.** New `POST /api/media/describe` `{image: base64}` → Workers AI VLM caption tuned for 3D reconstruction (shape/parts/colors/material). Model ids are tried in a fallback chain (`@cf/llava-hf/llava-1.5-7b-hf`, then `@cf/unum/uform-gen2-qwen-500m`) — **the current catalog ids could not be web-verified this session (tooling outage); confirm on first deploy** and reorder/replace as needed (`@cf/meta/llama-3.2-11b-vision-instruct` is the likely newer option but has a different input shape). Dev server got a real Gemini-vision implementation of the same endpoint (plus an honest 501 for `/api/media/generate`, and `express.json` limit raised to 8 MB for the base64 photo). Client flow (ImagePlus button in the 3D Studio): photo → canvas-downscale to ≤1024px JPEG → describe → the description drives the normal compose→compile pipeline → **the photo itself is applied as the triplanar albedo**, so the model wears the exact real-world surface it came from. Stats HUD shows `source: photo` + a texture row.
+
+**Model detail.** GPU lattice default raised 112³ → **144³** (~2.1× cells; affordable because the pipeline-compile cost was already fixed via caching — compute was measured trivial) and `MAX_TRIS` 350k → 500k so dense warp-heavy organics don't clip the atomic allocator. Base material gained `envMapIntensity: 1.1`.
+
+---
+
+## What changed in the 2026-07-08 pass (Claude) — 3D GPU domination + /image made real
+
+Followed the prior handoff's next-steps to the letter (deploy + verify /image, then pivoted per owner to "dominating 3D model creation"). Everything below is deployed and **browser-verified on a real RDNA-2 GPU** via Claude-in-Chrome — not just typechecked. Two prior sessions declared 3D "done" while the GPU path was silently dead; this pass proves it live.
+
+**3D GPU parity (MASTERPLAN 3D-1) — the flagship primitives now render on the GPU.** The WGSL kernel (`src/lib/sdf-gpu.ts`) only implemented 5 of 8 primitives and no warp, so every crystal / gem / spike / hex-nut / organically-warped model silently fell to the **60³ CPU path** while plain sphere/box models got the **112³ GPU path** — backwards. Ported `cone`, `hex`, `octahedron`, and the fBm noise-`warp` to WGSL as exact ports of the CPU formulations (the two backends must agree), widened `compileProgramAuto`'s GPU gate to allow all 8 prims + warp (op cap 24→64), and packed the new prim params + a `warp` vec4 into the uniform (grew 48→64 B).
+
+**Two latent GPU bugs found by the browser check (both would never surface in a CPU-only test):**
+1. **`meta` is a reserved word in modern WGSL/Tint.** The kernel's `Params.meta` field made `createShaderModule` **hard-fail to compile** in current Chrome → `generateMeshGPU` threw → silent CPU fallback for *every* model. The GPU path had been dead. Renamed `meta`→`cfg`. This is why the prior "GPU symmetry drop" audit fix never actually ran on GPU.
+2. **The pipeline recompiled on every generation.** The static kernel takes **~7 s to compile** (it inlines `sdProgram` ~24× through gradient/color/emit), and `generateMeshGPU` rebuilt the module+pipeline on *every* call — that was the entire cost of a "24-second" model. Now the module+pipeline are **cached per device** and `warmupGPU()` (exported; called on `Viewport3DSection` mount) compiles it up front so the first Generate skips the wait. **Measured live: crystal went 24,186 ms → 131 ms (field 53.5 ms), ~185×.** Same 73.6k tris @112³.
+
+Verified live: crystal (cone+hex+octahedron+radial symmetry) renders as a correct faceted gem on GPU @112³; a trivial 112³ dispatch is ~20 ms on this GPU, confirming compute was never the bottleneck. New **`npm run smoke:3d`** (`scripts/smoke-3d.ts`, tsx) enforces the MASTERPLAN standing rule: CPU parity of all presets, warp-field finiteness, GPU eligibility of the showcase programs, and packOps slot layout for the 3 new prims. `packOps`/`PRIM_ID` are now exported for that test.
+
+**`/image` is real now (SDXL-Lightning).** The FLUX.2-klein path the prior pass shipped never worked: it's a *multipart-input* model, but Workers AI on this account routes through the AI Gateway data plane, which **can't stream a multipart request body** ("does not support ReadableStreams yet"); a buffered multipart body is rejected `8001: Invalid input`. Both dead-end today (Cloudflare says a fix is in flight). Switched `/api/media/generate` to `@cf/bytedance/stable-diffusion-xl-lightning` (plain JSON input, flows through the gateway) and **buffer its output stream before R2.put** (R2 rejects unbounded streams — "must have a known length"). **Verified live: returns a valid 1024×1024 JPEG (~150 KB) stored in R2.** Client copy updated FLUX→SDXL in `NaturalConversationProgramming.tsx` (chip hint, runtime panel, result caption). To restore FLUX later, swap the model id back and send the multipart form body once CF ships the gateway fix.
+
+**Still open from this pass:** persist `/image` results into D1 chat history (still local-only messages — MASTERPLAN follow-up #2); component-internal copy for the four renamed sections (untouched this pass). Working tree is uncommitted — the owner should review + commit.
+
+---
+
+## What changed in the 2026-07-06 "minimal surface" pass (Claude, same day, after the audit)
+
+Product direction from the owner: *"the most beautiful simplistic look with all the power hidden underneath — natural conversation programming that dominates. If someone can think it, we can create it."* This pass executed the UI half plus the free backend wins; a Claude Code session picks up from here.
+
+**Shell** — the default sidebar is now just **Create** (Create/3D Studio/Media Studio/Deep Research) + **Build** (IDE + spec sections) + **Account**. The Operate and Labs groups (11 + 13 real sections) are hidden by default, one toggle away in Settings → Features; a "N more tools in Settings" affordance sits at the bottom of the sidebar. `aura-sidebar-hidden-v` version key resets returning users to the new minimal default. **Cut for good:** `fleet-health` (fictional MDM) and `3d-engine` (redundant WebGL demo) — section entries + routes removed; component files left on disk, unrouted. **Renamed honestly:** NPU→Neural Inference, Satellite Uplink→Orbital Tracking, Agent Swarm→System Telemetry, P2P WASM→WASM Workers. (Component-internal copy for those four still says the old names — small follow-up.)
+
+**NCP chat ("Create")** — hero empty state ("What should we build?") with 7 capability chips that seed expert-grade prompts: research paper, enterprise/regulatory app, video game, podcast, deep plan, image, 3D model (routes to the 3D Studio via a new optional `onNavigate` prop). Compact chip strip persists above the composer in ongoing conversations. The decorative provider/model/agent selectors are **gone** (they controlled nothing); replaced by an honest runtime panel (kimi-k2.6 · Durable Workflow · D1 · /image→FLUX). New **`/image <prompt>` slash command** calls the new image-gen endpoint and renders the result inline (local-only message; not persisted to D1 history yet — follow-up).
+
+**Worker** — new `POST /api/media/generate`: FLUX.2 [klein] on Workers AI → R2 (`gen/<ts>-<slug>.png`), returns `{key, url}`; handles both stream and base64 response shapes; logs to `ai_log`. The chat SYSTEM_PROMPT was rewritten around the "complete professional artifacts" promise (research/regulatory/games/podcasts/plans). **Untested against the live model — verify after next deploy** (the model string `@cf/black-forest-labs/flux-2-klein-4b` and its response shape come from RESEARCH.md's citations).
+
+**Free wins wired** — `useAutoSave` now mirrors every autosaved key to D1 via debounced `PUT /api/spec` (fire-and-forget; localStorage stays authoritative). `AnalyticsDashboard` gained a real "AI Usage — edge telemetry" table reading `/api/ai-stats` (first UI ever to read it), polling every 15 s, honest DEV badge locally.
+
+**Migrations** — `0002_spec_ai_log_and_users.sql` captures the live `spec_data`/`ai_log` schemas + widens `ai_log` (tokens_in/out, cost_usd, status) + adds `user_id` to chat tables + an endpoint/time index. **Already applied to production D1** (via API, 2026-07-06) — the file exists so fresh environments reproduce; `wrangler d1 migrations apply` on prod would re-run ALTERs and fail, so mark 0002 as applied if you adopt wrangler's migration tracking.
+
+Verified: `tsc --noEmit` and `tsc -p tsconfig.worker.json` both clean. **Not yet deployed** — needs `Deploy.cmd` / `npm run deploy:cf` on the owner's machine (includes the earlier 3D fixes too).
+
+**Suggested next steps for Claude Code:** deploy + verify /image and GPU-path 3D in a browser; persist generated images into chat history (D1); component-internal copy for the four renamed sections; then MASTERPLAN Phase 2 (AI inline-edit is the queued differentiator).
 
 ---
 
