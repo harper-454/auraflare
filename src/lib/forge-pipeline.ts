@@ -20,8 +20,11 @@ import {
 import { compileProgramAuto } from './sdf-gpu';
 import { compileAssemblies, type Animator } from './sdf-assembly';
 import { qaReviewProgram, renderSnapshot } from './sdf-qa';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { getReferenceGrounding } from './sdf-reference';
 import { exportGLB } from './meshforge';
+import { applyFamilyToGroup } from './sdf-material';
+import { inferMaterialFamily, MATERIAL_FAMILIES, type MaterialFamily } from './pbr-textures';
 
 export type ForgeStage = 'cache' | 'referencing' | 'composing' | 'compiling' | 'inspecting' | 'exporting';
 
@@ -39,7 +42,7 @@ export interface ForgeResult {
   blob: Blob;
   snapshot: string | null;
   label: string;
-  source: 'ai' | 'local' | 'cached';
+  source: 'ai' | 'local' | 'cached' | 'photoreal';
   triangles: number;
   opCount: number;
   backend: 'gpu' | 'cpu';
@@ -94,11 +97,63 @@ export async function compileAnyProgram(p: ShapeProgram) {
     };
   }
   const c = await compileProgramAuto(p);
+  // Single-mesh programs get their procedural PBR family here (assemblies
+  // handle theirs per part inside compileAssemblies).
+  const family = p.material && (MATERIAL_FAMILIES as string[]).includes(p.material)
+    ? p.material as MaterialFamily
+    : inferMaterialFamily(p.label);
+  if (family) applyFamilyToGroup(c.group, family, { metalness: p.metalness, roughness: p.roughness });
   return {
     group: c.group, triangles: c.triangles, opCount: c.opCount, backend: c.backend,
     resolution: c.resolution, fieldMs: c.fieldMs,
     parts: undefined as number | undefined, moving: undefined as number | undefined,
     animators: [] as Animator[], clips: [] as THREE.AnimationClip[],
+  };
+}
+
+/** Wrap a downloaded textured GLB (photoreal engine, gallery reloads) as a ForgeResult. */
+export async function resultFromGlbBlob(blob: Blob, label: string): Promise<ForgeResult> {
+  const buffer = await blob.arrayBuffer();
+  const gltf = await new Promise<any>((resolve, reject) => {
+    new GLTFLoader().parse(buffer, '', resolve, reject);
+  });
+  const group = new THREE.Group();
+  group.name = label.replace(/\W+/g, '-') || 'photoreal-model';
+  group.add(gltf.scene);
+
+  // Normalize into the viewport's working volume ([-1.2, 1.2], centered).
+  const box = new THREE.Box3().setFromObject(gltf.scene);
+  const size = box.getSize(new THREE.Vector3());
+  const maxDim = Math.max(size.x, size.y, size.z) || 1;
+  const s = 1.9 / maxDim;
+  gltf.scene.scale.setScalar(s);
+  const center = box.getCenter(new THREE.Vector3()).multiplyScalar(s);
+  gltf.scene.position.sub(center);
+
+  let triangles = 0;
+  group.traverse(obj => {
+    const mesh = obj as THREE.Mesh;
+    if (mesh.isMesh) {
+      const geo = mesh.geometry as THREE.BufferGeometry;
+      triangles += Math.round((geo.index ? geo.index.count : geo.attributes.position.count) / 3);
+    }
+  });
+
+  return {
+    program: null,
+    group,
+    animators: [],
+    clips: (gltf.animations ?? []) as THREE.AnimationClip[],
+    blob,
+    snapshot: renderSnapshot(group),
+    label,
+    source: 'photoreal',
+    triangles,
+    opCount: 0,
+    backend: 'gpu',
+    resolution: 0,
+    fieldMs: 0,
+    qaFindings: [],
   };
 }
 
@@ -276,15 +331,23 @@ export async function listGalleryModels(): Promise<GalleryEntry[]> {
     .reverse();
 }
 
-/** Reload a saved model — recompiles from its stored program. Zero AI calls. */
+/** Reload a saved model — recompiles from its stored program (zero AI calls),
+ *  or re-downloads the saved GLB for photoreal models (no program to recompile). */
 export async function loadGalleryModel(jsonKey: string): Promise<{ result: ForgeResult; prompt: string } | null> {
   const res = await fetch(`/api/media/${encodeURIComponent(jsonKey)}`);
   if (!res.ok) return null;
   const text = await res.text();
   let saved: any;
   try { saved = JSON.parse(text); } catch { return null; }
-  const program = sanitizeProgram(saved?.program, String(saved?.name ?? 'model'));
-  if (!program) return null;
-  const result = await forgeFromProgram(program, 'cached');
-  return { result, prompt: String(saved?.prompt ?? program.label) };
+  const program = saved?.program ? sanitizeProgram(saved.program, String(saved?.name ?? 'model')) : null;
+  if (program) {
+    const result = await forgeFromProgram(program, 'cached');
+    return { result, prompt: String(saved?.prompt ?? program.label) };
+  }
+  // Photoreal manifest: reload the stored GLB itself.
+  const glbKey = `${jsonKey.slice(0, -'.json'.length)}.glb`;
+  const glbRes = await fetch(`/api/media/${encodeURIComponent(glbKey)}`);
+  if (!glbRes.ok) return null;
+  const result = await resultFromGlbBlob(await glbRes.blob(), String(saved?.name ?? 'photoreal model'));
+  return { result, prompt: String(saved?.prompt ?? result.label) };
 }

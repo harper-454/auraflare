@@ -13,7 +13,9 @@ import { refineProgramWithAI, buildPreviewProgram, flattenProgram, type ShapePro
 import { warmupGPU } from '../lib/sdf-gpu';
 import { applyAnimators, type Animator } from '../lib/sdf-assembly';
 import { forgeModel, forgeFromProgram, type ForgeResult } from '../lib/forge-pipeline';
-import { getPreferredProvider, setPreferredProvider, listSelectableProviders, type PreferredProvider } from '../lib/ai-providers';
+import { getPreferredProvider, setPreferredProvider, listSelectableProviders, getPhotorealModel, type PreferredProvider } from '../lib/ai-providers';
+import { forgePhotoreal } from '../lib/photoreal';
+import { saveModelArtifacts } from '../lib/forge-pipeline';
 import { applyTriplanarToGroup, loadTexture } from '../lib/sdf-material';
 import { parsePromptLocally, generateModel, exportGLB } from '../lib/meshforge';
 import { BatchForgePanel } from './BatchForgePanel';
@@ -29,7 +31,7 @@ type Stats = {
   fieldMs: number;
   bytes: number;
   loadMs: number;
-  source: 'ai' | 'local' | 'photo' | 'cached';
+  source: 'ai' | 'local' | 'photo' | 'cached' | 'photoreal';
   parts?: number;   // articulated part count (assemblies + static base)
   moving?: number;  // how many parts carry a motion spec
   qa?: 'passed' | 'revised' | 'skipped'; // pre-delivery inspection outcome
@@ -128,6 +130,9 @@ export function Viewport3DSection() {
   const [isInspecting, setIsInspecting] = useState(false);
   // Reference grounding: real photos (or generated stand-ins) anchor the compose.
   const [isReferencing, setIsReferencing] = useState(false);
+  // Which generator: precision (SDF compiler — free, moving parts) or
+  // photoreal (generative 3D via fal — Luma-class textures, BYO key).
+  const [engine, setEngine] = useAutoSave<'precision' | 'photoreal'>('viewport-engine', 'precision');
 
   // 3D-2: live preview — build a fresh ShapeProgram from the prompt text using
   // keyword heuristics (no preset lookup), then raymarch it while the AI compose
@@ -180,6 +185,24 @@ export function Viewport3DSection() {
     setStats(null);
     loadStart.current = performance.now();
     try {
+      // Photoreal engine: true generative 3D (fal.ai) — real cloth/hair/wood
+      // textures baked into the mesh. Costs the user's fal credits, so errors
+      // surface directly (no silent fallback to the primitive engine), and
+      // every result is auto-saved to the library.
+      if (engine === 'photoreal') {
+        try {
+          const result = await forgePhotoreal(
+            photoDataUrl ? { imageDataUrl: photoDataUrl } : { prompt: text },
+            getPhotorealModel() ?? undefined,
+            stage => setIsReferencing(stage === 'reference'),
+          );
+          presentResult(result, { loadMs: Math.round(performance.now() - loadStart.current) });
+          saveModelArtifacts(text, result).catch(() => { /* library save is best-effort */ });
+        } catch (e: any) {
+          setError(`Photoreal failed: ${e?.message || e}`);
+        }
+        return;
+      }
       try {
         // The photo path is grounded by the photo itself — skip web references,
         // QA, and the cache; everything else shares the forge pipeline.
@@ -221,7 +244,7 @@ export function Viewport3DSection() {
       setIsInspecting(false);
       setIsGenerating(false);
     }
-  }, [prompt, presentResult]);
+  }, [prompt, presentResult, engine]);
 
   const runRefine = useCallback(async () => {
     const instruction = refineText.trim();
@@ -279,6 +302,12 @@ export function Viewport3DSection() {
     setError(null);
     try {
       const dataUrl = await photoToDataUrl(file);
+      if (engine === 'photoreal') {
+        // Photoreal: the photo goes straight into image-to-3D — no caption
+        // round-trip, the generative model reads the pixels itself.
+        await runForge(prompt.trim() || 'photo model', dataUrl);
+        return;
+      }
       const res = await fetch('/api/media/describe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -295,7 +324,7 @@ export function Viewport3DSection() {
     } finally {
       setIsPhotoLoading(false);
     }
-  }, [runForge, setPrompt]);
+  }, [runForge, setPrompt, engine, prompt]);
 
   const surprise = useCallback(() => {
     const idea = PROMPT_IDEAS[Math.floor(Math.random() * PROMPT_IDEAS.length)];
@@ -465,6 +494,23 @@ export function Viewport3DSection() {
           </h3>
 
           <div className="space-y-1">
+            <label className="text-xs text-slate-400 font-medium">Engine</label>
+            <div className="grid grid-cols-2 gap-1">
+              <button
+                onClick={() => setEngine('precision')}
+                title="SDF compiler — free, articulated moving parts, procedural PBR materials"
+                className={`py-1.5 text-xs rounded border ${engine === 'precision' ? 'bg-indigo-500/20 border-indigo-500 text-indigo-300' : 'bg-slate-800 border-transparent text-slate-400 hover:bg-slate-700'}`}
+              >Precision</button>
+              <button
+                onClick={() => setEngine('photoreal')}
+                title="Generative 3D (fal.ai) — Luma-class textured meshes: cloth, hair, wood, dirt. Needs a fal key in Settings → AI."
+                className={`py-1.5 text-xs rounded border ${engine === 'photoreal' ? 'bg-indigo-500/20 border-indigo-500 text-indigo-300' : 'bg-slate-800 border-transparent text-slate-400 hover:bg-slate-700'}`}
+              >Photoreal</button>
+            </div>
+          </div>
+
+          {engine === 'precision' && (
+          <div className="space-y-1">
             <label className="text-xs text-slate-400 font-medium">AI provider</label>
             <select
               value={preferredProvider}
@@ -475,6 +521,7 @@ export function Viewport3DSection() {
               {providerOptions.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
             </select>
           </div>
+          )}
 
           <div className="space-y-2">
             <button

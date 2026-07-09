@@ -228,10 +228,37 @@ User Query: ${message}
     }
   });
 
-  // ——— Media generation is edge-only (Workers AI + R2). Return honest JSON
-  // instead of letting the route fall through to Vite's SPA HTML. ———
-  app.post('/api/media/generate', (_req, res) => {
-    res.status(501).json({ error: 'Image/texture generation runs on the production Worker (Workers AI + R2). Use the deployed app.' });
+  // Photoreal 3D runs on the production Worker (fal relay + R2) — proxy it so
+  // the dev app has the full capability with zero extra config.
+  app.post('/api/photoreal/generate', async (req, res) => {
+    try {
+      const proxied = await fetch(`${PROD_ORIGIN}/api/photoreal/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req.body),
+      });
+      const data: any = await proxied.json().catch(() => ({ error: 'bad proxy response' }));
+      res.status(proxied.status).json(data);
+    } catch (err: any) {
+      res.status(502).json({ error: `photoreal proxy: ${err.message}` });
+    }
+  });
+
+  // ——— Media generation runs on the production Worker (Workers AI + R2);
+  // proxy it so dev has the full capability (images, textures, photoreal
+  // reference shots) with zero extra config. ———
+  app.post('/api/media/generate', async (req, res) => {
+    try {
+      const proxied = await fetch(`${PROD_ORIGIN}/api/media/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(req.body),
+      });
+      const data: any = await proxied.json().catch(() => ({ error: 'bad proxy response' }));
+      res.status(proxied.status).json(data);
+    } catch (err: any) {
+      res.status(502).json({ error: `media proxy: ${err.message}` });
+    }
   });
 
   // Vision caption has a Gemini-backed dev path so photo→3D works locally too.
@@ -298,7 +325,18 @@ User Query: ${message}
       const buf = await fs.promises.readFile(path.join(GALLERY_DIR, key));
       res.setHeader('Content-Type', 'model/gltf-binary');
       res.send(buf);
-    } catch { res.status(404).json({ error: 'not found' }); }
+    } catch {
+      // Not on local disk — the object may live in prod R2 (proxied media
+      // generation, photoreal GLBs). Stream it through so dev sees one store.
+      try {
+        const proxied = await fetch(`${PROD_ORIGIN}/api/media/${encodeURIComponent(req.params.key)}`);
+        if (!proxied.ok) return res.status(proxied.status).json({ error: 'not found' });
+        res.setHeader('Content-Type', proxied.headers.get('Content-Type') ?? 'application/octet-stream');
+        res.send(Buffer.from(await proxied.arrayBuffer()));
+      } catch {
+        res.status(404).json({ error: 'not found' });
+      }
+    }
   });
   app.delete('/api/media/:key', async (req, res) => {
     try {

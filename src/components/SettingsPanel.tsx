@@ -3,7 +3,8 @@ import { Settings, X, Moon, Sun, Download, Upload, LayoutGrid, Bot, KeyRound, Lo
 import { useEffect, useState } from 'react';
 import { StorageService } from '../lib/storage';
 import { SECTIONS, GROUP_LABELS, GROUP_ORDER, getHiddenSections, setHiddenSections } from '../sections';
-import { getProviderSettings, saveProviderSettings, getGeminiOAuthToken, newId, PROVIDER_TEMPLATES, testProvider, type CustomProvider, type ProviderSettings, type PreferredProvider } from '../lib/ai-providers';
+import { getProviderSettings, saveProviderSettings, getGeminiOAuthToken, newId, PROVIDER_TEMPLATES, testProvider, getFalKey, setFalKey, getPhotorealModel, setPhotorealModel, type CustomProvider, type ProviderSettings, type PreferredProvider } from '../lib/ai-providers';
+import { PHOTOREAL_MODELS } from '../lib/photoreal';
 import { useAuth } from './AuthProvider';
 import type { SectionId } from '../types';
 
@@ -21,6 +22,8 @@ function ProvidersTab() {
   const [hasOAuth, setHasOAuth] = useState<boolean>(() => !!getGeminiOAuthToken());
   const [expanded, setExpanded] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [falKey, setFalKeyState] = useState<string>(() => getFalKey() ?? '');
+  const [photorealModel, setPhotorealModelState] = useState<string>(() => getPhotorealModel() ?? PHOTOREAL_MODELS[0].id);
   // per-rung health-check state: id → testing | {ok, ms, reply?/error?}
   const [tests, setTests] = useState<Record<string, 'testing' | Awaited<ReturnType<typeof testProvider>>>>({});
 
@@ -220,6 +223,35 @@ function ProvidersTab() {
             <span className="block text-[9px] text-slate-500">Free · Workers AI — llama-3.3-70b (3D compose) + kimi-k2.6 (chat). Own trained model on the roadmap.</span>
           </div>
           <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400">ALWAYS ON</span>
+        </div>
+      </div>
+
+      <div className="pt-3 border-t border-slate-800/50">
+        <h3 className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5">Photoreal 3D (fal.ai)</h3>
+        <div className="space-y-1.5">
+          <label className="block">
+            <span className="text-[10px] font-medium text-slate-500">fal.ai API key</span>
+            <input
+              type="password"
+              value={falKey}
+              placeholder="key from fal.ai/dashboard/keys"
+              onChange={e => { setFalKeyState(e.target.value); setFalKey(e.target.value || undefined); }}
+              className="mt-0.5 w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-1.5 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-indigo-500"
+            />
+          </label>
+          <label className="block">
+            <span className="text-[10px] font-medium text-slate-500">3D model</span>
+            <select
+              value={photorealModel}
+              onChange={e => { setPhotorealModelState(e.target.value); setPhotorealModel(e.target.value); }}
+              className="mt-0.5 w-full bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+            >
+              {PHOTOREAL_MODELS.map(m => <option key={m.id} value={m.id}>{m.label}</option>)}
+            </select>
+          </label>
+          <p className="text-[9px] text-slate-600">
+            Powers the Studio's Photoreal engine — generative 3D with real baked textures (cloth, hair, wood). Text and photo input. Billed per model on your fal account.
+          </p>
         </div>
       </div>
 

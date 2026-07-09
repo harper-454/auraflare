@@ -1,7 +1,19 @@
 # AuraFlare — Handoff Notes
 
-**Last updated:** 2026-07-09 (second pass)
-**Status:** Production live at https://aura.massivenumber.com — deployed d3326cf0. Working tree uncommitted; owner should review + commit.
+**Last updated:** 2026-07-09 (third pass)
+**Status:** Production live at https://aura.massivenumber.com — deployed 95062e04.
+
+## 2026-07-09 third pass — the Luma answer: Photoreal engine + procedural PBR materials
+
+Owner ultimatum: models on par with Luma, with real materials (cloth/plastic/dirt/metal/wood/hair/clothing) or they walk. Two tracks shipped:
+
+**Photoreal engine (generative 3D, the model class Luma runs).** New Engine toggle in the Studio Controls: Precision (SDF, free, moving parts) | **Photoreal** — text → SDXL product shot → **fal.ai image-to-3D** → fully textured GLB; photo upload → image-to-3D directly (no caption round-trip). Server-side relay `/api/photoreal/generate` (worker; dev proxies to prod): queue.fal.run submit → poll → model-agnostic GLB-URL scan → stored to R2 `photoreal/`. BYO fal key (Settings → AI → Photoreal 3D; fal.ai/dashboard/keys), sent per-request, never persisted. Models offered: `fal-ai/hunyuan3d-v21` (~$0.15 textured), `fal-ai/trellis` (~$0.25), `fal-ai/trellis-2` (~$0.30). Results auto-save to the library (manifest with program:null → gallery reload re-downloads the GLB — `resultFromGlbBlob` in forge-pipeline normalizes scale/center, counts tris). Photoreal errors surface directly — no silent fallback to the primitive engine (it costs money; the user must see the real failure). NOT yet exercised end-to-end: needs the owner's fal key (60-second signup; every code path up to the fal call verified, and the fal request shape follows their documented queue REST).
+
+**Procedural PBR material packs (free, instant, deterministic).** `src/lib/pbr-textures.ts` paints albedo+roughness in-canvas per family — wood (grain rings + streaks), brushed metal, cloth (plain weave), plastic (mold flow lines), stone (granite veins), dirt (patchy soil) — cached, seeded, no downloads. The triplanar shader gained roughness-map sampling (same projection, `sdf-triplanar-v2-rough` cache key). Families flow from: explicit `"material"` on programs/assemblies (sanitized allowlist; compose/plan/refine instructions all ask for it) → else inferred from part names/labels (`inferMaterialFamily`). Applied per-part in compileAssemblies (wooden top + metal legs on one model) and per-program in compileAnyProgram. **Browser-verified: "a round wooden table with four legs" renders with visible wood grain on every part** (rim striping, vertical leg grain), refs online · 4 photos, gpu@144³.
+
+Dev/prod unification en route: dev `/api/media/generate` now proxies to prod (images/textures/photoreal reference shots work locally), and dev media GET falls back to prod R2 on local-disk miss (photoreal GLBs, cross-origin gallery objects).
+
+**Still open:** exercise Photoreal with a real fal key end-to-end; hair/character quality depends on the chosen fal model (Hunyuan v3.1 Pro adds full PBR maps at ~$0.375+0.15 — add `fal-ai/hunyuan-3d/v3.1/pro/image-to-3d` to PHOTOREAL_MODELS once tested); triplanar normal-map channel for the packs; cloth/hair on the Precision engine stays out of scope (that's what Photoreal is for).
 
 ## 2026-07-09 second pass — provider Test buttons + selection (owner: "no way to test GLM-5.2/MiniMax or select them")
 

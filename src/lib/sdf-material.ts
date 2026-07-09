@@ -15,6 +15,7 @@
  * a UV atlas (xatlas-web) is the known follow-up for textured export.
  */
 import * as THREE from 'three';
+import { getTexturePack, type MaterialFamily } from './pbr-textures';
 
 export interface SDFMaterialOpts {
   metalness?: number;
@@ -39,6 +40,8 @@ export interface TriplanarOpts {
   sharpness?: number;
   /** 0 = pure vertex part colors, 1 = fully textured. Texture is tinted by part color either way. */
   mix?: number;
+  /** Optional roughness map, triplanar-sampled with the same projection (green channel). */
+  roughnessTexture?: THREE.Texture;
 }
 
 /**
@@ -55,13 +58,20 @@ export function makeTriplanarMaterial(
   texture.wrapT = THREE.RepeatWrapping;
   texture.colorSpace = THREE.SRGBColorSpace;
 
+  const roughTex = opts.roughnessTexture ?? null;
+  if (roughTex) {
+    roughTex.wrapS = THREE.RepeatWrapping;
+    roughTex.wrapT = THREE.RepeatWrapping;
+  }
+
   const mat = makeSDFMaterial(base);
-  const uniforms = {
+  const uniforms: Record<string, { value: unknown }> = {
     uTriMap: { value: texture },
     uTriScale: { value: opts.scale ?? 1.5 },
     uTriSharp: { value: opts.sharpness ?? 4.0 },
     uTriMix: { value: opts.mix ?? 0.85 },
   };
+  if (roughTex) uniforms.uTriRough = { value: roughTex };
 
   mat.onBeforeCompile = shader => {
     Object.assign(shader.uniforms, uniforms);
@@ -108,12 +118,52 @@ vec3 triplanar(sampler2D map, vec3 p, vec3 n, float scale, float sharp) {
   diffuseColor.rgb = mix(diffuseColor.rgb, tinted, uTriMix);
 }`,
       );
+    if (roughTex) {
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform sampler2D uTriRough;')
+        .replace(
+          '#include <roughnessmap_fragment>',
+          `#include <roughnessmap_fragment>
+{
+  // Same projection as the albedo — material.roughness acts as the factor.
+  roughnessFactor *= triplanar(uTriRough, vTriPos, vTriNrm, uTriScale, uTriSharp).g;
+}`,
+        );
+    }
   };
   // three caches shader programs per-material-type; the injected chunks change
   // the program, so give it a distinct cache key or an untextured
   // MeshStandardMaterial elsewhere in the scene would reuse the wrong program.
-  mat.customProgramCacheKey = () => 'sdf-triplanar-v1';
+  mat.customProgramCacheKey = () => (roughTex ? 'sdf-triplanar-v2-rough' : 'sdf-triplanar-v1');
   return mat;
+}
+
+/**
+ * Dress every mesh in a group in a procedural PBR family (wood grain, brushed
+ * metal, cloth weave, plastic, stone, dirt) — triplanar albedo + roughness,
+ * tinted by the per-vertex part colors so painted parts keep their identity.
+ */
+export function applyFamilyToGroup(
+  group: THREE.Group,
+  family: MaterialFamily,
+  base: SDFMaterialOpts = {},
+): void {
+  const pack = getTexturePack(family);
+  const mat = makeTriplanarMaterial(pack.map, {
+    metalness: base.metalness ?? pack.metalness,
+    roughness: base.roughness ?? pack.roughness,
+  }, {
+    scale: pack.scale,
+    mix: 0.9,
+    roughnessTexture: pack.roughnessMap,
+  });
+  group.traverse(obj => {
+    const mesh = obj as THREE.Mesh;
+    if (mesh.isMesh) {
+      (mesh.material as THREE.Material)?.dispose();
+      mesh.material = mat;
+    }
+  });
 }
 
 /** Swap every mesh in a generated group onto one triplanar-textured material. */

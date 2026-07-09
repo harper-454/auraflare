@@ -36,6 +36,10 @@ export interface CustomProvider {
 
 export interface ProviderSettings {
   providers: CustomProvider[];
+  /** fal.ai key for the Photoreal 3D engine (image → textured GLB). */
+  falKey?: string;
+  /** Preferred photoreal model id (fal endpoint id). */
+  photorealModel?: string;
 }
 
 const SETTINGS_KEY = 'aura-ai-providers-v2';
@@ -79,6 +83,24 @@ export function getProviderSettings(): ProviderSettings {
 
 export function saveProviderSettings(settings: ProviderSettings): void {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+}
+
+export function getFalKey(): string | null {
+  return getProviderSettings().falKey?.trim() || null;
+}
+
+export function setFalKey(key: string | undefined): void {
+  const s = getProviderSettings();
+  saveProviderSettings({ ...s, falKey: key?.trim() || undefined });
+}
+
+export function getPhotorealModel(): string | null {
+  return getProviderSettings().photorealModel || null;
+}
+
+export function setPhotorealModel(id: string | undefined): void {
+  const s = getProviderSettings();
+  saveProviderSettings({ ...s, photorealModel: id || undefined });
 }
 
 export function newId(): string {

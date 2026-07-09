@@ -84,6 +84,7 @@ export interface Assembly {
   motion?: Motion;
   metalness?: number;  // per-part material override (brass gears in a steel case)
   roughness?: number;
+  material?: string;   // procedural PBR family: wood|metal|cloth|plastic|stone|dirt
 }
 
 export interface ShapeProgram {
@@ -95,6 +96,7 @@ export interface ShapeProgram {
   assemblies?: Assembly[]; // articulated parts — each compiles to its own mesh
   metalness?: number;
   roughness?: number;
+  material?: string;       // procedural PBR family for the static base
 }
 
 // ——— per-op precomputation (inverse rotation as a 3×3 matrix) ———
@@ -658,6 +660,13 @@ function sanitizeSymmetries(raw: any): Symmetry[] | undefined {
 
 const MOTION_KINDS: MotionKind[] = ['spin', 'oscillate', 'piston'];
 const AXES = ['x', 'y', 'z'] as const;
+const MATERIAL_NAMES = ['wood', 'metal', 'cloth', 'plastic', 'stone', 'dirt'];
+
+function sanitizeMaterial(m: unknown): string | undefined {
+  return typeof m === 'string' && MATERIAL_NAMES.includes(m.toLowerCase().trim())
+    ? m.toLowerCase().trim()
+    : undefined;
+}
 
 function sanitizeMotion(m: any): Motion | undefined {
   if (!m || typeof m !== 'object' || !MOTION_KINDS.includes(m.kind)) return undefined;
@@ -696,6 +705,7 @@ function sanitizeAssemblies(raw: any): Assembly[] | undefined {
       motion: sanitizeMotion(a.motion),
       metalness: a.metalness !== undefined ? num(a.metalness, 0.15, 0, 1) : undefined,
       roughness: a.roughness !== undefined ? num(a.roughness, 0.55, 0, 1) : undefined,
+      material: sanitizeMaterial(a.material),
     });
   }
   return out.length ? out : undefined;
@@ -722,6 +732,7 @@ export function sanitizeProgram(raw: any, fallbackLabel: string): ShapeProgram |
     assemblies,
     metalness: raw.metalness !== undefined ? num(raw.metalness, 0.15, 0, 1) : undefined,
     roughness: raw.roughness !== undefined ? num(raw.roughness, 0.55, 0, 1) : undefined,
+    material: sanitizeMaterial(raw.material),
   };
 }
 
@@ -809,6 +820,7 @@ CSG MODES (mode field, ops apply in order):
 OPTIONAL FIELD MODIFIERS (top-level, all optional):
 - "metalness": 0-1 (0 dielectric, 1 metal)
 - "roughness": 0-1 (0 mirror, 1 matte)
+- "material": "wood"|"metal"|"cloth"|"plastic"|"stone"|"dirt" — real surface texture (wood grain, brushed metal, cloth weave…). ALWAYS set it when the object has an obvious material; assemblies can each carry their own "material" (wooden table top + metal legs).
 - "warp": {"amp":0.04,"freq":7,"octaves":4,"seed":0} — adds organic fBm noise displacement. Use amp 0.03-0.08 for bark/coral/rock, 0.08-0.15 for rugged terrain. SKIP for smooth manufactured objects.
 
 OPTIONAL SYMMETRY DSL (top-level, expands repeated parts for you — use these to avoid listing every primitive):
@@ -903,7 +915,9 @@ const PLAN_INSTRUCTIONS = `You are the layout planner of a 3D model factory. Dec
 {"label":"short name","category":"vehicle|timepiece|engine|furniture|building|creature|handheld|other","metalness":0-1,"roughness":0-1,"parts":[
   {"name":"kebab-name","role":"what this part is/does","pos":[x,y,z],"scale":0.1-1.0,"rot":[x,y,z] optional euler degrees,
    "moving":{"kind":"spin","axis":"y","rpm":12} optional — see motion rules,
-   "hint":"one line describing the part's shape for the geometry pass","color":"#rrggbb","metalness":0-1 optional,"roughness":0-1 optional}]}
+   "hint":"one line describing the part's shape for the geometry pass","color":"#rrggbb",
+   "material":"wood|metal|cloth|plastic|stone|dirt" (the part's real surface — set it whenever obvious),
+   "metalness":0-1 optional,"roughness":0-1 optional}]}
 
 DECOMPOSE LIKE A FACTORY PLANNER (canonical parts per category):
 - timepiece: case-ring, dial-face, hour-hand(spin y, slow), minute-hand(spin y, faster), second-hand(spin y, rpm 8-15 for visible demo), crown, 1-3 visible gears(spin, alternating sign)
@@ -972,6 +986,7 @@ export async function composeComplexWithAI(prompt: string, refNotes?: string | n
         motion: p.moving,
         metalness: r?.metalness ?? p.metalness,
         roughness: r?.roughness ?? p.roughness,
+        material: r?.material ?? p.material,
       };
     });
 

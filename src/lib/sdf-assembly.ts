@@ -23,6 +23,14 @@
 import * as THREE from 'three';
 import type { Assembly, Motion, ShapeProgram } from './sdf-compiler';
 import { compileProgramAuto } from './sdf-gpu';
+import { applyFamilyToGroup } from './sdf-material';
+import { inferMaterialFamily, MATERIAL_FAMILIES, type MaterialFamily } from './pbr-textures';
+
+/** Explicit family hint, else inferred from the part's own name ("oak-table-top"). */
+function familyFor(explicit: string | undefined, nameHint: string): MaterialFamily | null {
+  if (explicit && (MATERIAL_FAMILIES as string[]).includes(explicit)) return explicit as MaterialFamily;
+  return inferMaterialFamily(nameHint);
+}
 
 export interface Animator {
   /** The asm_<name> group the motion mutates (child of the placement group). */
@@ -61,6 +69,8 @@ export async function compileAssemblies(program: ShapeProgram): Promise<Assembly
   if (program.ops.length) {
     const base = await compileProgramAuto({ ...program, assemblies: undefined });
     base.group.name = 'base';
+    const baseFamily = familyFor(program.material, program.label);
+    if (baseFamily) applyFamilyToGroup(base.group, baseFamily, { metalness: program.metalness, roughness: program.roughness });
     root.add(base.group);
     triangles += base.triangles;
     opCount += base.opCount;
@@ -80,6 +90,9 @@ export async function compileAssemblies(program: ShapeProgram): Promise<Assembly
       metalness: a.metalness ?? program.metalness,
       roughness: a.roughness ?? program.roughness,
     });
+
+    const family = familyFor(a.material, a.name);
+    if (family) applyFamilyToGroup(sub.group, family, { metalness: a.metalness ?? program.metalness, roughness: a.roughness ?? program.roughness });
 
     // Inner group = the animation target, spinning about the part's local
     // origin (the pivot the planner placed). Outer group = static placement.

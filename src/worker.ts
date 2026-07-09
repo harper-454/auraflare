@@ -458,6 +458,77 @@ export default {
       }
     }
 
+    // ── Photoreal 3D: image → textured GLB via fal.ai (BYO key, server-side) ──
+    // The same generative-3D model class Luma/Meshy run (TRELLIS, Hunyuan3D).
+    // Queue-submit with the user's fal key, poll to completion, pull the GLB,
+    // store it in R2 so the client loads same-origin. Key travels per-request
+    // and is never persisted server-side.
+    if (pathname === '/api/photoreal/generate' && request.method === 'POST') {
+      const { falKey, model, imageUrl, textured } = await request.json<{
+        falKey?: string; model?: string; imageUrl?: string; textured?: boolean;
+      }>().catch(() => ({} as { falKey?: string; model?: string; imageUrl?: string; textured?: boolean }));
+      if (!falKey) return json({ error: 'falKey required — add your fal.ai key in Settings → AI' }, 400);
+      if (!imageUrl) return json({ error: 'imageUrl required (public URL or data URI)' }, 400);
+      const modelId = (model || 'fal-ai/hunyuan3d-v21').replace(/[^a-z0-9/._-]/gi, '');
+      const started = Date.now();
+      try {
+        // Input field names differ per model family; send both spellings —
+        // fal endpoints ignore unknown fields.
+        const submit = await fetch(`https://queue.fal.run/${modelId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Key ${falKey}` },
+          body: JSON.stringify({
+            image_url: imageUrl,
+            input_image_url: imageUrl,
+            textured_mesh: textured !== false,
+          }),
+        });
+        const sub: any = await submit.json().catch(() => ({}));
+        if (!submit.ok) return json({ error: sub?.detail || sub?.error || `fal submit ${submit.status}` }, 502);
+        const statusUrl: string = sub.status_url || `https://queue.fal.run/${modelId}/requests/${sub.request_id}/status`;
+        const resultUrl: string = sub.response_url || `https://queue.fal.run/${modelId}/requests/${sub.request_id}`;
+
+        // Poll to completion (these models run 30–180 s).
+        let done = false;
+        for (let i = 0; i < 90 && !done; i++) {
+          await new Promise(res => setTimeout(res, 3000));
+          const st = await fetch(statusUrl, { headers: { Authorization: `Key ${falKey}` } });
+          const s: any = await st.json().catch(() => ({}));
+          if (s.status === 'COMPLETED') done = true;
+          else if (s.status === 'FAILED' || s.status === 'ERROR') {
+            return json({ error: `fal generation failed: ${JSON.stringify(s.error ?? s).slice(0, 300)}` }, 502);
+          }
+        }
+        if (!done) return json({ error: 'fal generation timed out (~4.5 min)' }, 504);
+
+        const resultRes = await fetch(resultUrl, { headers: { Authorization: `Key ${falKey}` } });
+        const result: any = await resultRes.json().catch(() => ({}));
+        // Model families name the output differently — scan for the first
+        // mesh-file URL anywhere in the payload.
+        const findGlb = (o: any): string | null => {
+          if (!o || typeof o !== 'object') return null;
+          if (typeof o.url === 'string' && /\.(glb|gltf)(\?|$)/i.test(o.url)) return o.url;
+          for (const v of Object.values(o)) {
+            const hit = findGlb(v);
+            if (hit) return hit;
+          }
+          return null;
+        };
+        const glbUrl = findGlb(result);
+        if (!glbUrl) return json({ error: `no GLB in fal result: ${JSON.stringify(result).slice(0, 300)}` }, 502);
+
+        const glb = await fetch(glbUrl);
+        if (!glb.ok) return json({ error: `GLB download ${glb.status}` }, 502);
+        const body = await glb.arrayBuffer();
+        const key = `photoreal/${Date.now()}-${modelId.split('/').pop()}.glb`;
+        await env.BUCKET.put(key, body, { httpMetadata: { contentType: 'model/gltf-binary' } });
+        ctx.waitUntil(logAi(env, 'photoreal-3d', modelId, false, Date.now() - started));
+        return json({ ok: true, key, url: `/api/media/${encodeURIComponent(key)}`, bytes: body.byteLength, ms: Date.now() - started });
+      } catch (e: any) {
+        return json({ error: e.message }, 502);
+      }
+    }
+
     // ── BYO-provider relay: OpenAI-compatible hosts that block browser CORS ──
     // The client's provider chain tries the provider directly from the browser
     // first; on a network-level (CORS) failure it retries through here with the
