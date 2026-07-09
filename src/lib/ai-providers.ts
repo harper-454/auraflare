@@ -179,16 +179,118 @@ async function callAnthropic(message: string, p: CustomProvider, ms: number): Pr
   });
 }
 
+/** One provider entry, any kind, one call. */
+async function callProvider(p: CustomProvider, message: string, timeoutMs: number): Promise<string> {
+  if (p.kind === 'gemini') return callGemini(message, p.baseUrl, p.model, { apiKey: p.apiKey }, timeoutMs);
+  if (p.kind === 'anthropic') return callAnthropic(message, p, timeoutMs);
+  return callOpenAICompatible(message, p, timeoutMs);
+}
+
+async function callCloud(message: string, context: string, timeoutMs: number): Promise<string> {
+  return withTimeout(timeoutMs, async signal => {
+    const res = await fetch('/api/chat-sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal,
+      body: JSON.stringify({ message, context }),
+    });
+    if (!res.ok) throw new Error(`server ${res.status}`);
+    const data = await res.json();
+    if (data.error) throw new Error(String(data.error));
+    const text = String(data.text ?? '');
+    if (!text.trim()) throw new Error('server empty reply');
+    return text;
+  });
+}
+
+// ── preferred provider (the Studio/chat selector) ────────────────────────────
+// 'auto' = full chain (OAuth → list → Cloud). A provider id, 'oauth', or
+// 'cloud' forces that single rung — STRICT, no silent fallback, so selecting a
+// provider doubles as testing it: if it fails you see the real error.
+
+const PREFERRED_KEY = 'aura-ai-preferred-provider';
+export type PreferredProvider = 'auto' | 'oauth' | 'cloud' | string;
+
+export function getPreferredProvider(): PreferredProvider {
+  return localStorage.getItem(PREFERRED_KEY) || 'auto';
+}
+export function setPreferredProvider(id: PreferredProvider): void {
+  if (id === 'auto') localStorage.removeItem(PREFERRED_KEY);
+  else localStorage.setItem(PREFERRED_KEY, id);
+}
+
+/** The selectable rungs, for building picker UIs. */
+export function listSelectableProviders(): Array<{ id: PreferredProvider; name: string }> {
+  const out: Array<{ id: PreferredProvider; name: string }> = [{ id: 'auto', name: 'Auto (chain)' }];
+  if (getGeminiOAuthToken()) out.push({ id: 'oauth', name: 'Gemini (Google sign-in)' });
+  for (const p of getProviderSettings().providers) {
+    if (p.enabled && p.baseUrl && p.model) out.push({ id: p.id, name: `${p.name} · ${p.model}` });
+  }
+  out.push({ id: 'cloud', name: 'AuraFlare Cloud (built-in)' });
+  return out;
+}
+
 /**
- * Single-shot completion through the chain: Gemini OAuth → user providers in
- * order → AuraFlare Cloud. Throws only if every rung fails; callers keep their
- * offline fallbacks (presets, parametric, preview program) on throw.
+ * Health-check one rung with a trivial prompt. Returns latency + a reply
+ * snippet on success, the real error message on failure.
+ */
+export async function testProvider(
+  id: PreferredProvider,
+  timeoutMs = 25000,
+): Promise<{ ok: boolean; ms: number; reply?: string; error?: string }> {
+  const started = Date.now();
+  const probe = 'Reply with exactly: OK';
+  try {
+    let text: string;
+    if (id === 'oauth') {
+      const token = getGeminiOAuthToken();
+      if (!token) throw new Error('no Google sign-in token this session');
+      text = await callGemini(probe, 'https://generativelanguage.googleapis.com', 'gemini-3.1-pro-preview', { bearer: token }, timeoutMs);
+    } else if (id === 'cloud' || id === 'auto') {
+      text = await callCloud(probe, 'provider-test', timeoutMs);
+    } else {
+      const p = getProviderSettings().providers.find(x => x.id === id);
+      if (!p) throw new Error('provider not found');
+      if (!p.baseUrl || !p.model) throw new Error('base URL and model are required');
+      text = await callProvider(p, probe, timeoutMs);
+    }
+    return { ok: true, ms: Date.now() - started, reply: text.trim().slice(0, 60) };
+  } catch (e: any) {
+    return { ok: false, ms: Date.now() - started, error: String(e?.message ?? e).slice(0, 200) };
+  }
+}
+
+/**
+ * Single-shot completion. Default ('auto'): the chain — Gemini OAuth → user
+ * providers in order → AuraFlare Cloud; throws only if every rung fails
+ * (callers keep their offline fallbacks). When the user has SELECTED a
+ * provider (Studio/chat picker), only that rung runs and its real error
+ * propagates — an explicit choice should never be silently substituted.
  */
 export async function aiChatSync(
   message: string,
   context: string,
   timeoutMs = 20000,
 ): Promise<{ text: string; provider: string }> {
+  const preferred = getPreferredProvider();
+
+  if (preferred !== 'auto') {
+    if (preferred === 'oauth') {
+      const token = getGeminiOAuthToken();
+      if (!token) throw new Error('Google sign-in expired — sign in again in Settings → AI, or switch the provider selector');
+      const text = await callGemini(message, 'https://generativelanguage.googleapis.com', 'gemini-3.1-pro-preview', { bearer: token }, timeoutMs);
+      return { text, provider: 'Gemini (Google sign-in)' };
+    }
+    if (preferred === 'cloud') {
+      return { text: await callCloud(message, context, timeoutMs), provider: 'AuraFlare Cloud' };
+    }
+    const p = getProviderSettings().providers.find(x => x.id === preferred);
+    if (!p || !p.enabled || !p.baseUrl || !p.model) {
+      throw new Error('selected provider is missing or disabled — pick another in the provider selector');
+    }
+    return { text: await callProvider(p, message, timeoutMs), provider: p.name };
+  }
+
   const oauth = getGeminiOAuthToken();
   if (oauth) {
     try {
@@ -202,24 +304,9 @@ export async function aiChatSync(
   for (const p of getProviderSettings().providers) {
     if (!p.enabled || !p.baseUrl || !p.model) continue;
     try {
-      const text =
-        p.kind === 'gemini' ? await callGemini(message, p.baseUrl, p.model, { apiKey: p.apiKey }, timeoutMs)
-        : p.kind === 'anthropic' ? await callAnthropic(message, p, timeoutMs)
-        : await callOpenAICompatible(message, p, timeoutMs);
-      return { text, provider: p.name };
+      return { text: await callProvider(p, message, timeoutMs), provider: p.name };
     } catch { /* next provider */ }
   }
 
-  return withTimeout(timeoutMs, async signal => {
-    const res = await fetch('/api/chat-sync', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal,
-      body: JSON.stringify({ message, context }),
-    });
-    if (!res.ok) throw new Error(`server ${res.status}`);
-    const data = await res.json();
-    if (data.error) throw new Error(String(data.error));
-    return { text: String(data.text ?? ''), provider: 'AuraFlare Cloud' };
-  });
+  return { text: await callCloud(message, context, timeoutMs), provider: 'AuraFlare Cloud' };
 }

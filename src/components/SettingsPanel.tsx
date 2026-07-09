@@ -3,7 +3,7 @@ import { Settings, X, Moon, Sun, Download, Upload, LayoutGrid, Bot, KeyRound, Lo
 import { useEffect, useState } from 'react';
 import { StorageService } from '../lib/storage';
 import { SECTIONS, GROUP_LABELS, GROUP_ORDER, getHiddenSections, setHiddenSections } from '../sections';
-import { getProviderSettings, saveProviderSettings, getGeminiOAuthToken, newId, PROVIDER_TEMPLATES, type CustomProvider, type ProviderSettings } from '../lib/ai-providers';
+import { getProviderSettings, saveProviderSettings, getGeminiOAuthToken, newId, PROVIDER_TEMPLATES, testProvider, type CustomProvider, type ProviderSettings, type PreferredProvider } from '../lib/ai-providers';
 import { useAuth } from './AuthProvider';
 import type { SectionId } from '../types';
 
@@ -21,6 +21,23 @@ function ProvidersTab() {
   const [hasOAuth, setHasOAuth] = useState<boolean>(() => !!getGeminiOAuthToken());
   const [expanded, setExpanded] = useState<string | null>(null);
   const [pickerOpen, setPickerOpen] = useState(false);
+  // per-rung health-check state: id → testing | {ok, ms, reply?/error?}
+  const [tests, setTests] = useState<Record<string, 'testing' | Awaited<ReturnType<typeof testProvider>>>>({});
+
+  const runTest = async (id: PreferredProvider) => {
+    setTests(t => ({ ...t, [id]: 'testing' }));
+    const result = await testProvider(id);
+    setTests(t => ({ ...t, [id]: result }));
+  };
+
+  const testBadge = (id: string) => {
+    const t = tests[id];
+    if (!t) return null;
+    if (t === 'testing') return <span className="text-[9px] text-slate-500 animate-pulse">testing…</span>;
+    return t.ok
+      ? <span className="text-[9px] text-emerald-400" title={`replied: ${t.reply}`}>✓ {t.ms} ms</span>
+      : <span className="text-[9px] text-rose-400" title={t.error}>✗ {t.error?.slice(0, 48)}</span>;
+  };
 
   const commit = (next: ProviderSettings) => { setSettings(next); saveProviderSettings(next); };
   const patch = (id: string, p: Partial<CustomProvider>) =>
@@ -62,12 +79,26 @@ function ProvidersTab() {
           <LogIn className="w-3.5 h-3.5" />
           {user ? `Signed in as ${user.email ?? user.displayName ?? 'Google user'}` : 'Sign in with Google (Gemini)'}
         </button>
-        <p className={`mt-1.5 text-[10px] ${hasOAuth ? 'text-emerald-400' : 'text-slate-600'}`}>
-          {hasOAuth
-            ? '✓ Gemini OAuth active — tried before everything below'
-            : user
-              ? 'Signed in, but no Gemini token this session — sign in again to grant it.'
-              : 'Gemini access with your Google account — no API key needed.'}
+        <p className={`mt-1.5 text-[10px] flex items-center gap-2 ${hasOAuth ? 'text-emerald-400' : 'text-slate-600'}`}>
+          <span className="flex-1">
+            {hasOAuth
+              ? '✓ Gemini OAuth active — tried before everything below'
+              : user
+                ? 'Signed in, but no Gemini token this session — sign in again to grant it.'
+                : 'Gemini access with your Google account — no API key needed.'}
+          </span>
+          {hasOAuth && (
+            <>
+              {testBadge('oauth')}
+              <button
+                onClick={() => runTest('oauth')}
+                disabled={tests['oauth'] === 'testing'}
+                className="px-1.5 py-0.5 text-[9px] font-medium bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 rounded disabled:opacity-40 transition-colors"
+              >
+                Test
+              </button>
+            </>
+          )}
         </p>
       </div>
 
@@ -93,6 +124,15 @@ function ProvidersTab() {
                   <span className={`text-xs font-medium ${p.enabled ? 'text-slate-200' : 'text-slate-500'}`}>{p.name}</span>
                   <span className="ml-2 text-[10px] font-mono text-slate-500">{p.model}</span>
                   {!p.apiKey && p.kind !== 'openai' && <span className="ml-2 text-[9px] text-amber-400">no key</span>}
+                </button>
+                {testBadge(p.id)}
+                <button
+                  onClick={() => runTest(p.id)}
+                  disabled={tests[p.id] === 'testing' || !p.baseUrl || !p.model}
+                  className="px-1.5 py-0.5 text-[9px] font-medium bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 rounded disabled:opacity-40 transition-colors"
+                  title="Send a tiny prompt through this provider and show latency or the real error"
+                >
+                  Test
                 </button>
                 <button onClick={() => move(p.id, -1)} disabled={i === 0} className="text-slate-600 hover:text-slate-300 disabled:opacity-30 text-[10px]" title="Higher priority">▲</button>
                 <button onClick={() => move(p.id, 1)} disabled={i === settings.providers.length - 1} className="text-slate-600 hover:text-slate-300 disabled:opacity-30 text-[10px]" title="Lower priority">▼</button>
@@ -154,6 +194,21 @@ function ProvidersTab() {
               <button onClick={() => setPickerOpen(false)} className="w-full text-[10px] text-slate-500 hover:text-slate-300 pt-1">cancel</button>
             </div>
           )}
+        </div>
+
+        <div className="mt-3 flex items-center gap-2 px-2.5 py-2 bg-slate-900/60 border border-slate-800/60 rounded-md">
+          <span className="flex-1">
+            <span className="text-xs font-medium text-slate-300">AuraFlare Cloud</span>
+            <span className="block text-[9px] text-slate-600">Built-in default & final fallback — Workers AI, no key needed.</span>
+          </span>
+          {testBadge('cloud')}
+          <button
+            onClick={() => runTest('cloud')}
+            disabled={tests['cloud'] === 'testing'}
+            className="px-1.5 py-0.5 text-[9px] font-medium bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 rounded disabled:opacity-40 transition-colors"
+          >
+            Test
+          </button>
         </div>
       </div>
 

@@ -87,19 +87,30 @@ export function BatchForgePanel({ onModelReady }: {
       <button
         onClick={() => setOpen(o => !o)}
         title="Batch Forge — queue prompts, get a saved model library"
-        className={`w-9 h-9 flex items-center justify-center rounded-full transition-colors shadow-lg ${open ? 'bg-amber-500 hover:bg-amber-400 text-slate-950' : 'bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700'}`}
+        className={`w-9 h-9 flex items-center justify-center rounded-full transition-colors shadow-lg ${open ? 'bg-indigo-500 hover:bg-indigo-400 text-white' : 'bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200'}`}
       >
         <Layers className="w-4 h-4" />
       </button>
 
       {open && (
-        <div className="absolute bottom-16 left-4 z-20 w-[26rem] max-w-[calc(100%-2rem)] bg-slate-900/95 backdrop-blur border border-slate-700 rounded-lg shadow-2xl p-3 space-y-3">
-          <div className="flex items-center justify-between">
-            <h3 className="text-xs font-semibold text-slate-200 flex items-center gap-1.5"><Layers className="w-3.5 h-3.5" /> Batch Forge</h3>
-            <label className="flex items-center gap-1.5 text-[10px] text-slate-400 cursor-pointer" title="Skip the QA inspection round — half the AI calls per model">
-              <input type="checkbox" checked={fastMode} onChange={e => setFastMode(e.target.checked)} className="accent-amber-500" />
-              fast mode
-            </label>
+        // w-96 fixed + viewport-relative cap: the absolute parent is the narrow
+        // button row, so a percentage max-width would crush the panel.
+        <div className="absolute bottom-12 left-0 z-20 w-96 max-w-[80vw] bg-slate-900/90 backdrop-blur border border-slate-700 rounded-lg p-4 shadow-xl space-y-3">
+          <h3 className="text-sm font-semibold text-slate-200 border-b border-slate-800 pb-2 flex items-center gap-2">
+            <Layers className="w-4 h-4" /> Batch Forge
+          </h3>
+
+          <div className="space-y-2">
+            <button
+              onClick={() => setFastMode(f => !f)}
+              className="flex items-center gap-2 cursor-pointer group w-full text-left"
+              title="Skip the QA inspection round — half the AI calls per model"
+            >
+              <div className={`w-8 h-4 rounded-full flex items-center p-0.5 transition-colors ${fastMode ? 'bg-indigo-500' : 'bg-slate-700'}`}>
+                <div className={`w-3 h-3 bg-white rounded-full transition-transform ${fastMode ? 'translate-x-4' : 'translate-x-0'}`} />
+              </div>
+              <span className="text-xs text-slate-300 group-hover:text-white transition-colors">Fast mode (skip QA)</span>
+            </button>
           </div>
 
           <textarea
@@ -108,7 +119,7 @@ export function BatchForgePanel({ onModelReady }: {
             placeholder={'One model per line…\na desk fan with spinning blades\na wooden water wheel\na grandfather clock with swinging pendulum'}
             rows={3}
             disabled={running}
-            className="w-full bg-slate-950 border border-slate-800 rounded px-2.5 py-2 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-amber-500 disabled:opacity-60 resize-y"
+            className="w-full bg-slate-950/80 backdrop-blur border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-indigo-500 disabled:opacity-50 resize-y"
           />
 
           <div className="flex gap-2">
@@ -116,51 +127,55 @@ export function BatchForgePanel({ onModelReady }: {
               <button
                 onClick={runBatch}
                 disabled={!promptsText.trim()}
-                className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 bg-amber-600 hover:bg-amber-500 disabled:bg-amber-600/40 disabled:cursor-not-allowed text-white rounded text-xs font-medium transition-colors"
+                title="Forge every prompt and save each model to the library"
+                className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-600/40 disabled:cursor-not-allowed text-white rounded text-xs transition-colors"
               >
-                <Play className="w-3 h-3" /> Forge all
+                <Play className="w-3.5 h-3.5" /> Forge all
               </button>
             ) : (
               <button
                 onClick={() => { stopRef.current = true; }}
-                className="flex-1 flex items-center justify-center gap-1.5 px-3 py-1.5 bg-rose-600 hover:bg-rose-500 text-white rounded text-xs font-medium transition-colors"
+                className="flex-1 flex items-center justify-center gap-2 px-3 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded text-xs transition-colors"
               >
-                <Square className="w-3 h-3" /> Stop after current
+                <Square className="w-3.5 h-3.5" /> Stop after current
               </button>
             )}
             <button
               onClick={refreshGallery}
               title="Refresh library"
-              className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 rounded text-xs transition-colors"
+              className="px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 rounded flex items-center justify-center transition-colors"
             >
-              <RefreshCw className="w-3 h-3" />
+              <RefreshCw className="w-3.5 h-3.5" />
             </button>
           </div>
 
           {items.length > 0 && (
-            <div className="space-y-1 max-h-32 overflow-y-auto pr-1">
+            <div className="space-y-1 max-h-32 overflow-y-auto pr-1 text-[11px] font-mono">
               {items.map((it, i) => (
-                <div key={i} className="flex items-center gap-2 text-[10px] font-mono">
-                  <span className={`shrink-0 w-20 uppercase ${statusColor[it.status] ?? 'text-slate-400'}`}>{it.status}</span>
-                  <span className="flex-1 truncate text-slate-300" title={it.prompt}>{it.prompt}</span>
-                  {it.detail && <span className="shrink-0 text-slate-500">{it.detail}</span>}
+                <div key={i} className="flex justify-between gap-2">
+                  <span className={`shrink-0 ${statusColor[it.status] ?? 'text-slate-400'}`}>{it.status}</span>
+                  <span className="flex-1 truncate text-right text-slate-300" title={`${it.prompt}${it.detail ? ` — ${it.detail}` : ''}`}>
+                    {it.detail || it.prompt}
+                  </span>
                 </div>
               ))}
             </div>
           )}
 
-          <div className="pt-2 border-t border-slate-800/60">
-            <h4 className="text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-1.5 flex items-center gap-1"><FolderOpen className="w-3 h-3" /> Library ({gallery.length})</h4>
+          <div className="pt-3 border-t border-slate-800 space-y-2">
+            <label className="text-xs text-slate-400 font-medium flex items-center gap-1.5">
+              <FolderOpen className="w-3.5 h-3.5" /> Library ({gallery.length})
+            </label>
             {gallery.length === 0 ? (
-              <p className="text-[10px] text-slate-600">Nothing saved yet — forge a batch and it lands here.</p>
+              <p className="text-[11px] font-mono text-slate-500">Nothing saved yet — forge a batch and it lands here.</p>
             ) : (
-              <div className="space-y-1 max-h-36 overflow-y-auto pr-1">
+              <div className="space-y-1 max-h-36 overflow-y-auto pr-1 text-[11px] font-mono">
                 {gallery.map(entry => (
-                  <div key={entry.jsonKey} className="flex items-center gap-2 text-[11px]">
+                  <div key={entry.jsonKey} className="flex justify-between items-center gap-2">
                     <button
                       onClick={() => loadSaved(entry)}
                       disabled={loadingKey === entry.jsonKey}
-                      className="flex-1 text-left truncate text-slate-300 hover:text-amber-300 transition-colors disabled:opacity-50"
+                      className="flex-1 text-left truncate text-slate-300 hover:text-indigo-300 transition-colors disabled:opacity-50"
                       title="Load (recompiles from the saved program — no AI calls)"
                     >
                       {loadingKey === entry.jsonKey ? 'loading…' : entry.name}
@@ -171,7 +186,7 @@ export function BatchForgePanel({ onModelReady }: {
                       className="shrink-0 text-slate-500 hover:text-slate-200 transition-colors"
                       title="Download animated .glb"
                     >
-                      <Download className="w-3 h-3" />
+                      <Download className="w-3.5 h-3.5" />
                     </a>
                   </div>
                 ))}

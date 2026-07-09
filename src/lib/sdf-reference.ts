@@ -119,7 +119,16 @@ async function generatedReferences(term: string, signal: AbortSignal): Promise<s
   return urls;
 }
 
-const NOTES_PROMPT = 'This sheet tiles multiple reference photos of the SAME kind of object. Distill the CONSENSUS across them (ignore outliers): 1) canonical parts every example shares, 2) relative proportions as rough numbers (e.g. "dial diameter ~5x hand width"), 3) typical colors/materials, 4) which parts move and how. At most 8 terse lines, no prose.';
+// Fill-in template, not an open question: small VLMs (llava-7b) answer open
+// "distill the consensus" prompts by parroting the category labels back
+// ("1. Handle shape, 2. Handle length, ...") with zero content. Forcing each
+// slot to be COMPLETED with observed shapes/colors/ratios gets real notes out
+// of the same model.
+const NOTES_PROMPT = 'The image tiles several reference photos of the SAME kind of object. Complete each line below with what you actually OBSERVE across the photos (shapes, colors, rough ratios). Write the completed lines only — never repeat a label without completing it.\nBODY: (overall 3D form, e.g. "cylinder about 1.2x taller than wide, flat bottom")\nPARTS: (each distinct part + its shape, e.g. "C-shaped handle on the side; flat circular base")\nCOLORS/MATERIALS: (dominant colors and material look)\nPROPORTIONS: (1-3 rough ratios, e.g. "handle about half the body height")';
+
+// Notes that contain no shape/color/size vocabulary are parroted labels or
+// hallucinated filler — grounding on them is worse than no grounding.
+const SHAPE_WORDS = /\d|cylind|sphere|round|circular|flat|curved|tall|wide|thin|thick|dome|tube|cone|ring|rectang|square|box|handle|leg|spout|rim|white|black|red|blue|green|brown|gray|grey|metal|wood|ceramic|glass|plastic/i;
 
 async function extractNotes(sheet: string, term: string): Promise<string | null> {
   try {
@@ -131,7 +140,10 @@ async function extractNotes(sheet: string, term: string): Promise<string | null>
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.error) return null;
     const notes = String(data.description ?? '').trim();
-    return notes || null;
+    if (!notes || !SHAPE_WORDS.test(notes)) return null;
+    // uncompleted template lines ("BODY:", "1. Handle shape,") without content
+    const contentLines = notes.split('\n').filter(l => l.trim() && !/^[A-Z/ ]+:\s*$/.test(l.trim()));
+    return contentLines.length ? contentLines.join('\n').slice(0, 900) : null;
   } catch {
     return null;
   }

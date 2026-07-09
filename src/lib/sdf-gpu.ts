@@ -31,7 +31,7 @@ export interface CompileResult {
 // polygonize now has a full-resolution GPU path. The WGSL formulations are exact
 // ports of the CPU ones in sdf-compiler.ts — the two backends must agree so
 // switching between them never changes the mesh.
-export const PRIM_ID: Record<PrimOp['prim'], number> = { sphere: 0, box: 1, capsule: 2, torus: 3, ellipsoid: 4, cone: 5, hex: 6, octahedron: 7 };
+export const PRIM_ID: Record<PrimOp['prim'], number> = { sphere: 0, box: 1, capsule: 2, torus: 3, ellipsoid: 4, cone: 5, hex: 6, octahedron: 7, cylinder: 8 };
 const MODE_ID: Record<NonNullable<PrimOp['mode']>, number> = { union: 0, smooth: 1, subtract: 2, intersect: 3 };
 const FLOATS_PER_OP = 24; // 6 × vec4
 // 500k tris = 18 MB per attribute buffer (pos/nrm/col) — comfortably under the
@@ -116,8 +116,14 @@ fn sdPrim(base : u32, wp : vec3<f32>) -> f32 {
     d2 = max(d2, ax - pr.x);
     return max(d2, abs(p.y) - pr.y);
   }
-  // t == 7u: octahedron (bound approximation, matches CPU).
-  return (abs(p.x) + abs(p.y) + abs(p.z) - pr.x) * 0.57735027;
+  if (t == 7u) {
+    // octahedron (bound approximation, matches CPU).
+    return (abs(p.x) + abs(p.y) + abs(p.z) - pr.x) * 0.57735027;
+  }
+  // t == 8u: capped cylinder along Y — pr.x = radius, pr.y = half-height (matches CPU).
+  let cd2 = length(p.xz) - pr.x;
+  let cdy = abs(p.y) - pr.y;
+  return min(max(cd2, cdy), 0.0) + length(max(vec2<f32>(cd2, cdy), vec2<f32>(0.0)));
 }
 
 fn sminf(a : f32, b : f32, k : f32) -> f32 {
@@ -355,6 +361,7 @@ export function packOps(program: ShapeProgram): Float32Array {
         break;
       }
       case 'cone': out[o + 20] = op.r ?? 0.3; out[o + 21] = op.h ?? 0.6; break;
+      case 'cylinder': out[o + 20] = op.r ?? 0.3; out[o + 21] = op.h ?? 0.4; break;
       case 'hex': {
         const s = op.size ?? [0.35, 0.3, 0.3];
         out[o + 20] = s[0]; out[o + 21] = s[1];
@@ -521,7 +528,7 @@ export async function compileProgramAuto(program: ShapeProgram, gpuRes = 144, cp
   // Kernel supports every primitive + warp; the only bound is op count (matches
   // expandProgram's own cap). The prim check stays as a defensive guard so an
   // unrecognized future primitive falls back to CPU instead of packing as sphere.
-  const gpuSupportedPrims = new Set(['sphere', 'box', 'capsule', 'torus', 'ellipsoid', 'cone', 'hex', 'octahedron']);
+  const gpuSupportedPrims = new Set(['sphere', 'box', 'capsule', 'torus', 'ellipsoid', 'cone', 'hex', 'octahedron', 'cylinder']);
   const gpuCompatible = expanded.ops.length <= 64
     && expanded.ops.every(o => gpuSupportedPrims.has(o.prim));
 

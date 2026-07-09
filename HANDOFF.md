@@ -1,7 +1,34 @@
 # AuraFlare — Handoff Notes
 
-**Last updated:** 2026-07-08 (third pass)
-**Status:** Production live at https://aura.massivenumber.com — deployed ae7ab28e. Working tree uncommitted; owner should review + commit.
+**Last updated:** 2026-07-09 (second pass)
+**Status:** Production live at https://aura.massivenumber.com — deployed d3326cf0. Working tree uncommitted; owner should review + commit.
+
+## 2026-07-09 second pass — provider Test buttons + selection (owner: "no way to test GLM-5.2/MiniMax or select them")
+
+- **`testProvider(id)`** (`ai-providers.ts`): health-checks any rung (OAuth / a provider / Cloud) with a tiny probe; returns latency or the real error. Settings → AI now has a **Test button on every provider row**, the OAuth line, and a new always-on **AuraFlare Cloud row**. Verified live in the owner's browser: GLM-5.2 ✓ 4.7 s, MiniMax M3 ✓ 5.4 s, Cloud ✓ 3.7 s.
+- **Preferred-provider selection** (`getPreferredProvider`/`setPreferredProvider`, localStorage, app-wide): 'auto' = existing chain; a specific rung is **STRICT** — no silent fallback, its real error surfaces (selection doubles as testing). Honored inside `aiChatSync`, so the whole Studio pipeline (compose/plan/refine/QA) follows it.
+- **Studio**: "AI provider" dropdown in Controls; the stats HUD now shows a **provider row** (which model composed the mesh — threaded `provider` through composeWithAI/composeComplexWithAI → ForgeResult).
+- **Chat**: provider dropdown in the runtime panel. Auto/Cloud = durable server workflow as before. A specific provider = **DIRECT mode** — messages go browser→provider with the user's key (which can't reach the server workflow), replies render locally with an honest "not saved to the durable thread" note; the DURABLE badge swaps to "<PROVIDER> · DIRECT" and the runtime panel cells update (Execution "Direct · browser → provider", Memory "local only").
+- Both tsconfigs clean, smoke suite green, deployed d3326cf0.
+
+---
+
+## What changed in the 2026-07-09 pass (Claude) — visual accuracy: the blob-mug fix
+
+Owner escalation: generations must be visually/detail accurate or they walk. Reproduced the failure live in one try: **"a white coffee mug with a curved handle" → a 2-op white blob that QA PASSED**, with 4 reference photos in hand. Root-caused via the network log (all three AI responses inspected):
+1. **Reference notes were parroted garbage** — llava-7b answered the open "distill the consensus" prompt with the category labels themselves ("1. Handle shape, 2. Handle length, …").
+2. **The composer under-modeled** — llama-3.3-70b emitted ellipsoid+capsule; there was NO cylinder primitive (the workhorse of man-made objects), and the sanitizer **silently deleted** any op with an unknown prim name.
+3. **QA rubber-stamped** — llava-7b, asked for a verdict, said "PASS" to a blob.
+
+Fixes (all on the free default path, no user keys):
+- **`cylinder` primitive end-to-end**: CPU SDF (IQ capped cylinder, r + h=half-height), WGSL kernel (prim id 8), GLSL raytracer, packOps, GPU gate, QA opRadius, compose/refine instructions.
+- **Prim alias map in the sanitizer** (`sdf-compiler.ts`): tube/pipe/rod/disk→cylinder, cube/slab→box, ring/donut→torus, pyramid→cone, ball→sphere, etc. — unknown names map to the nearest real primitive instead of vanishing.
+- **COMPOSE_INSTRUCTIONS rewritten around structural decomposition**: hollow containers MUST subtract a cavity, handles are torus rings, wheels are rotated cylinders, legs repeat via symmetry, flat tops are boxes/short cylinders, shape adjectives honored literally ("round table top" = cylinder, never box), "under-modeling is the #1 failure" + a worked mug example (cavity + torus handle).
+- **Deterministic structural validator** (`validateProgramFeatures`, sdf-compiler.ts): prompt-implied features (cavity/handle/wheels/legs/min-op-count) must exist in the geometry — microseconds, model-independent. Runs in `forgeModel` **even in fast mode** with ONE corrective refine (accepted only if it reduces findings), and feeds QA findings.
+- **QA is now describe-then-judge** (`sdf-qa.ts`): the small VLM only *describes* the render literally (with a parroting filter); the strong text model judges request + reference notes + render description + program JSON together. QA refine now demands MINIMAL edits (the old free-form revision bolted a square top + stray shapes onto a correct round table).
+- **Reference notes prompt is a fill-in template** (BODY/PARTS/COLORS/PROPORTIONS) with a shape-vocabulary garbage filter — parroted or empty notes are discarded rather than poisoning the compose.
+
+**Verified in the browser (dev, same free models):** the identical mug prompt now composes cylinder body + subtract cavity + torus handle + base (5 ops, textbook), renders as an unmistakable mug, 197.9k tris gpu@144³. "A round wooden table with four legs" → recognizable table, legs via radial×4 part symmetry (QA revision quality is the remaining weak link — hence the minimal-edits constraint). Smoke suite grew sections [7] cylinder + [8] validator (28 checks total, all green); both tsconfigs clean; deployed 485a7136 and the live bundle verified to contain the new code. Also this pass: `server.ts` PORT env override + `autoPort` in launch.json (another chat holds :3000).
 
 ---
 

@@ -11,7 +11,7 @@
  */
 import {
   compileProgram, evaluateFieldCPU, expandProgram,
-  sanitizeProgram, flattenProgram, totalProgramOps, BOUND,
+  sanitizeProgram, flattenProgram, totalProgramOps, validateProgramFeatures, BOUND,
   type ShapeProgram, type PrimKind,
 } from '../src/lib/sdf-compiler';
 import { packOps, PRIM_ID } from '../src/lib/sdf-gpu';
@@ -275,6 +275,55 @@ const clips = buildAnimationClips(anims);
 ok(clips.length === 1 && clips[0].tracks.length === 2, `one clip, ${clips[0]?.tracks.length} tracks`);
 ok(clips[0].tracks[0].name === 'asm_second-hand.quaternion' && clips[0].tracks[1].name === 'asm_piston-1.position', 'track names target the motion groups');
 ok(clips[0].duration >= 4.9, `clip covers the slowest period (${clips[0].duration.toFixed(1)} s)`);
+
+console.log('\n[7] Cylinder primitive (CPU SDF, packing, alias mapping)');
+const mugFixture: ShapeProgram = {
+  label: 'mug',
+  ops: [
+    { prim: 'cylinder', mode: 'union', color: '#f5f5f0', pos: [0, -0.1, 0], r: 0.5, h: 0.55 },
+    { prim: 'cylinder', mode: 'subtract', color: '#f5f5f0', pos: [0, 0.02, 0], r: 0.43, h: 0.55 },
+    { prim: 'torus', mode: 'union', color: '#f5f5f0', pos: [0.58, -0.05, 0], rot: [90, 0, 0], R: 0.26, r: 0.06 },
+  ],
+};
+const mugMesh = compileProgram(mugFixture, 48);
+ok(mugMesh.triangles > 1000, `hollow mug (cylinder+subtract+torus) polygonizes: ${mugMesh.triangles} tris`);
+{
+  const p = packOps({ label: 't', ops: [{ prim: 'cylinder', mode: 'union', color: '#ffffff', pos: [0, 0, 0], r: 0.35, h: 0.5 }] });
+  ok(p[0] === PRIM_ID.cylinder && p[0] === 8, 'cylinder prim id = 8');
+  ok(Math.abs(p[20] - 0.35) < 1e-6 && Math.abs(p[21] - 0.5) < 1e-6, 'cylinder r@20, h@21');
+}
+{
+  // aliases resolve instead of silently dropping (the blob-mug root cause)
+  const aliased = sanitizeProgram({
+    label: 'alias test',
+    ops: [
+      { prim: 'cylinder', mode: 'union', color: '#ffffff', pos: [0, 0, 0], r: 0.4, h: 0.5 },
+      { prim: 'tube', mode: 'union', color: '#ffffff', pos: [0, 0, 0], r: 0.2, h: 0.4 },
+      { prim: 'cube', mode: 'union', color: '#ffffff', pos: [0, 0, 0], size: [0.2, 0.2, 0.2] },
+      { prim: 'ring', mode: 'union', color: '#ffffff', pos: [0, 0, 0], R: 0.4, r: 0.1 },
+      { prim: 'nonsense-shape', mode: 'union', color: '#ffffff', pos: [0, 0, 0], r: 0.3 },
+    ],
+  }, 'alias');
+  ok(aliased!.ops.length === 4, `aliases mapped, junk dropped: ${aliased!.ops.length}/5 ops survive`);
+  ok(aliased!.ops.map(o => o.prim).join(',') === 'cylinder,cylinder,box,torus', `alias kinds: ${aliased!.ops.map(o => o.prim).join(',')}`);
+}
+
+console.log('\n[8] Structural validator (the blob-mug backstop)');
+{
+  const blob: ShapeProgram = {
+    label: 'mug',
+    ops: [
+      { prim: 'ellipsoid', mode: 'union', color: '#ffffff', pos: [0, 0, 0], size: [0.6, 0.4, 0.6] },
+      { prim: 'capsule', mode: 'smooth', color: '#ffffff', pos: [-0.5, 0.2, 0], r: 0.1, size: [0.2, 0.6, 0] },
+    ],
+  };
+  const blobFindings = validateProgramFeatures('a white coffee mug with a curved handle', blob);
+  ok(blobFindings.length >= 2, `2-op blob-mug flagged: ${blobFindings.length} findings (cavity + handle + under-modeled)`);
+  ok(blobFindings.some(f => f.includes('subtract')), 'missing cavity finding names the fix (subtract)');
+  const goodFindings = validateProgramFeatures('a white coffee mug with a curved handle', { ...mugFixture, ops: [...mugFixture.ops, { prim: 'cylinder', mode: 'union', color: '#eee', pos: [0, -0.68, 0], r: 0.42, h: 0.04 }] });
+  ok(goodFindings.length === 0, 'real mug program passes clean');
+  ok(validateProgramFeatures('a stone sphere', { label: 's', ops: [{ prim: 'sphere', mode: 'union', color: '#888', pos: [0, 0, 0], r: 0.8 }] }).length === 0, 'simple prompt + simple program not over-flagged');
+}
 
 console.log(`\n${failures === 0 ? '✅ ALL 3D SMOKE TESTS PASSED' : `❌ ${failures} FAILURE(S)`}`);
 process.exit(failures === 0 ? 0 : 1);

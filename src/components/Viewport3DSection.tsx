@@ -13,6 +13,7 @@ import { refineProgramWithAI, buildPreviewProgram, flattenProgram, type ShapePro
 import { warmupGPU } from '../lib/sdf-gpu';
 import { applyAnimators, type Animator } from '../lib/sdf-assembly';
 import { forgeModel, forgeFromProgram, type ForgeResult } from '../lib/forge-pipeline';
+import { getPreferredProvider, setPreferredProvider, listSelectableProviders, type PreferredProvider } from '../lib/ai-providers';
 import { applyTriplanarToGroup, loadTexture } from '../lib/sdf-material';
 import { parsePromptLocally, generateModel, exportGLB } from '../lib/meshforge';
 import { BatchForgePanel } from './BatchForgePanel';
@@ -33,6 +34,7 @@ type Stats = {
   moving?: number;  // how many parts carry a motion spec
   qa?: 'passed' | 'revised' | 'skipped'; // pre-delivery inspection outcome
   ref?: string; // reference grounding: "online · 4 photos" | "generated · 2"
+  provider?: string; // which AI provider composed the program
 };
 
 /**
@@ -106,6 +108,11 @@ export function Viewport3DSection() {
   const [stats, setStats] = useState<Stats | null>(null);
   const loadStart = useRef(0);
 
+  // Provider selection (shared app-wide via localStorage; honored by aiChatSync).
+  // Options recompute on each open of the section so Settings edits show up.
+  const [preferredProvider, setPreferredProviderState] = useState<PreferredProvider>(() => getPreferredProvider());
+  const providerOptions = useMemo(() => listSelectableProviders(), []);
+
   // Texturing (triplanar projection — SDF meshes have no UVs) + photo→3D.
   const [textureText, setTextureText] = useState('');
   const [isTexturing, setIsTexturing] = useState(false);
@@ -161,7 +168,7 @@ export function Viewport3DSection() {
     setStats({
       triangles: r.triangles, opCount: r.opCount, backend: r.backend, resolution: r.resolution,
       fieldMs: r.fieldMs, bytes: r.blob.size, loadMs: opts?.loadMs ?? 0,
-      source: r.source, parts: r.parts, moving: r.moving, qa: r.qa, ref: r.ref,
+      source: r.source, parts: r.parts, moving: r.moving, qa: r.qa, ref: r.ref, provider: r.provider,
     });
   }, []);
 
@@ -457,6 +464,18 @@ export function Viewport3DSection() {
             <Cog className="w-4 h-4" /> Controls
           </h3>
 
+          <div className="space-y-1">
+            <label className="text-xs text-slate-400 font-medium">AI provider</label>
+            <select
+              value={preferredProvider}
+              onChange={e => { setPreferredProvider(e.target.value as PreferredProvider); setPreferredProviderState(e.target.value as PreferredProvider); }}
+              title="Which model composes 3D programs. Auto tries the whole chain; a specific choice is strict — its real error shows if it fails. Manage providers in Settings → AI."
+              className="w-full bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+            >
+              {providerOptions.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+            </select>
+          </div>
+
           <div className="space-y-2">
             <button
               onClick={() => setSpin(s => !s)}
@@ -504,6 +523,7 @@ export function Viewport3DSection() {
           <div className="absolute bottom-4 right-4 z-10 w-60 bg-slate-900/90 backdrop-blur border border-slate-700 rounded-lg p-3 shadow-xl space-y-1 text-[11px] font-mono">
             <div className="flex justify-between"><span className="text-slate-500">label</span><span className="text-slate-200 truncate max-w-[140px]" title={label}>{label}</span></div>
             <div className="flex justify-between"><span className="text-slate-500">source</span><span className="text-indigo-300">{stats.source}</span></div>
+            {stats.provider && <div className="flex justify-between"><span className="text-slate-500">provider</span><span className="text-fuchsia-300 truncate max-w-[140px]" title={stats.provider}>{stats.provider}</span></div>}
             <div className="flex justify-between"><span className="text-slate-500">backend</span><span className="text-emerald-300">{stats.backend}{stats.resolution ? ` @${stats.resolution}³` : ''}</span></div>
             {stats.opCount !== null && <div className="flex justify-between"><span className="text-slate-500">ops</span><span className="text-slate-300">{stats.opCount}</span></div>}
             {stats.parts !== undefined && stats.parts > 1 && <div className="flex justify-between"><span className="text-slate-500">parts</span><span className="text-amber-300">{stats.parts}{stats.moving ? ` · ${stats.moving} moving` : ''}</span></div>}

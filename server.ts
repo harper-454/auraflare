@@ -9,7 +9,7 @@ import { exec } from 'child_process';
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   // 8 MB: /api/media/describe receives a downscaled photo as base64 JSON.
   app.use(express.json({ limit: '8mb' }));

@@ -15,7 +15,7 @@ import * as THREE from 'three';
 import { makeSDFMaterial } from './sdf-material';
 import { aiChatSync } from './ai-providers';
 
-export type PrimKind = 'sphere' | 'box' | 'capsule' | 'torus' | 'ellipsoid' | 'cone' | 'hex' | 'octahedron';
+export type PrimKind = 'sphere' | 'box' | 'capsule' | 'torus' | 'ellipsoid' | 'cone' | 'hex' | 'octahedron' | 'cylinder';
 export type CsgMode = 'union' | 'smooth' | 'subtract' | 'intersect';
 
 export interface PrimOp {
@@ -193,6 +193,17 @@ function primDist(op: CompiledOp, px: number, py: number, pz: number): number {
       const r = op.r ?? 0.4;
       const sX = Math.abs(x), sY = Math.abs(y), sZ = Math.abs(z);
       return (sX + sY + sZ - r) * 0.57735027;
+    }
+    case 'cylinder': {
+      // IQ exact capped cylinder along Y: r = radius, h = HALF-height (±h).
+      // The workhorse of man-made objects — mugs, cans, wheels, table legs,
+      // towers. Its absence was why composers reached for blobby ellipsoids.
+      const r = op.r ?? 0.3;
+      const h = op.h ?? 0.4;
+      const d2 = Math.sqrt(x * x + z * z) - r;
+      const dy = Math.abs(y) - h;
+      const ox = Math.max(d2, 0), oy = Math.max(dy, 0);
+      return Math.min(Math.max(d2, dy), 0) + Math.sqrt(ox * ox + oy * oy);
     }
   }
 }
@@ -568,8 +579,31 @@ export function polygonizeField(program: ShapeProgram, field: Float32Array, reso
 // former presets live on only as polygonizer fixtures in scripts/smoke-3d.ts.)
 
 // ——— sanitizer for LLM-emitted programs ———
-const PRIMS: PrimKind[] = ['sphere', 'box', 'capsule', 'torus', 'ellipsoid', 'cone', 'hex', 'octahedron'];
+const PRIMS: PrimKind[] = ['sphere', 'box', 'capsule', 'torus', 'ellipsoid', 'cone', 'hex', 'octahedron', 'cylinder'];
 const MODES: CsgMode[] = ['union', 'smooth', 'subtract', 'intersect'];
+
+// LLMs reach for natural shape names outside our vocabulary. Silently dropping
+// those ops was a top accuracy killer (a "cylinder" mug body just vanished, and
+// a 2-op blob shipped) — map every common alias to the nearest real primitive.
+const PRIM_ALIASES: Record<string, PrimKind> = {
+  cylinder: 'cylinder', tube: 'cylinder', pipe: 'cylinder', rod: 'cylinder',
+  disk: 'cylinder', disc: 'cylinder', puck: 'cylinder', can: 'cylinder',
+  cube: 'box', cuboid: 'box', block: 'box', slab: 'box', plate: 'box', rectangle: 'box',
+  ball: 'sphere', orb: 'sphere', dome: 'sphere',
+  pyramid: 'cone', spike: 'cone', tip: 'cone',
+  ring: 'torus', donut: 'torus', doughnut: 'torus', hoop: 'torus',
+  egg: 'ellipsoid', oval: 'ellipsoid', blob: 'ellipsoid',
+  prism: 'hex', hexagon: 'hex', nut: 'hex',
+  diamond: 'octahedron', gem: 'octahedron',
+  pill: 'capsule', stick: 'capsule', bar: 'capsule',
+};
+
+function resolvePrim(raw: unknown): PrimKind | null {
+  if (typeof raw !== 'string') return null;
+  const p = raw.toLowerCase().trim();
+  if ((PRIMS as string[]).includes(p)) return p as PrimKind;
+  return PRIM_ALIASES[p] ?? null;
+}
 
 function num(x: unknown, d: number, lo: number, hi: number): number {
   return typeof x === 'number' && isFinite(x) ? Math.min(hi, Math.max(lo, x)) : d;
@@ -583,9 +617,10 @@ function sanitizeOps(rawOps: any, cap: number): PrimOp[] {
   const ops: PrimOp[] = [];
   if (!Array.isArray(rawOps)) return ops;
   for (const o of rawOps.slice(0, cap)) {
-    if (!o || !PRIMS.includes(o.prim)) continue;
+    const prim = o ? resolvePrim(o.prim) : null;
+    if (!prim) continue;
     ops.push({
-      prim: o.prim,
+      prim,
       mode: MODES.includes(o.mode) ? o.mode : 'union',
       color: typeof o.color === 'string' && /^#[0-9a-f]{6}$/i.test(o.color) ? o.color : '#7b8cfa',
       pos: vec3(o.pos, [0, 0, 0], -1.2, 1.2),
@@ -606,7 +641,9 @@ function sanitizeParts(raw: any): PartDef[] | undefined {
   const parts: PartDef[] | undefined = Array.isArray(raw) && raw.length
     ? raw.slice(0, 12).map((p: any) => ({
         name: String(p.name || 'part').slice(0, 24),
-        ops: (Array.isArray(p.ops) ? p.ops : []).slice(0, 16).filter((o: any) => o && PRIMS.includes(o.prim)),
+        ops: (Array.isArray(p.ops) ? p.ops : []).slice(0, 16)
+          .map((o: any) => { const prim = o ? resolvePrim(o.prim) : null; return prim ? { ...o, prim } : null; })
+          .filter(Boolean),
       })).filter((p: PartDef) => p.ops.length > 0)
     : undefined;
   return parts && parts.length ? parts : undefined;
@@ -756,8 +793,9 @@ PRIMITIVES (prim field):
 - sphere: r (radius)
 - box: size = [half-x, half-y, half-z]
 - ellipsoid: size = radii (thin Z = wings/horns/snouts)
-- capsule: segment from pos to pos+size, radius r (limbs, bodies, stems)
-- torus: R (major) + r (tube), lies in XZ plane (use rot to tilt)
+- capsule: segment from pos to pos+size, radius r (limbs, stems, curved organic bodies)
+- cylinder: r (radius) + h (HALF-height, extends ±h along Y) — mugs, cans, wheels (rot 90 about x or z), table legs, towers, plates (small h). THE default for man-made round parts; do NOT substitute ellipsoids for cylindrical bodies.
+- torus: R (major) + r (tube), lies in XZ plane (use rot to tilt) — handles, rims, rings, tires
 - cone: r (base radius) + h (height, apex up along +Y) — hats, teeth, spikes, towers
 - hex: size = [radial, half-height, _] — hexagonal prisms, nuts, bolts, crystals
 - octahedron: r — gems, dice, crystals (8-faced, like two pyramids base-to-base)
@@ -789,15 +827,70 @@ OPTIONAL ARTICULATED ASSEMBLIES (top-level "assemblies" — machines with moving
 - The part moves about ITS OWN origin — author it centered on the pivot (a clock hand's shaft at [0,0,0] with the blade extending +x; a gear centered at [0,0,0]).
 - Static housing/chassis stays in the top-level "ops"; only moving or logically-separable parts become assemblies. A gear = hex or torus body + "radial" symmetry of box teeth.
 
+STRUCTURAL DECOMPOSITION — what makes an object RECOGNIZABLE (this is where most models fail; get these right before any detail):
+- HOLLOW containers (mug, cup, bowl, vase, pot, glass, bucket, jar, pitcher): outer body, then a "subtract" op of the same shape slightly smaller and RAISED so the rim opens upward and the bottom stays closed. A container without its cavity reads as a blob — never skip it.
+- HANDLES: a torus positioned at the body's side, rotated so the ring stands vertical (rot [90,0,0] for a side handle facing z), roughly 1/3 buried in the body.
+- SPOUTS: a rotated capsule or cone leaning out of the body.
+- WHEELS: cylinders rotated 90° so the flat faces point sideways; tires can be a torus around them.
+- LEGS (tables, chairs, animals): thin cylinders or capsules from the underside down; use symmetries to repeat.
+- RIMS/BANDS: a thin torus following the body's silhouette.
+- FLAT surfaces (table tops, seats, screens, roofs): boxes or short cylinders (small h), NOT ellipsoids.
+
 RULES:
 - Everything must fit inside [-1.2, 1.2] on every axis. Y is UP. Build 6-20 ops (or fewer ops + symmetries).
-- Think like a sculptor: big masses first, then details. Use "smooth" mode + blend to fuse parts.
+- UNDER-MODELING IS THE #1 FAILURE. Fewer than 5 ops is almost never enough for a real object: model the main mass, every structural feature the name implies (cavity, handle, legs, lid, spout…), then at least one detail layer.
+- Think like a modeler: silhouette first, then structural features, then details. Use "smooth" mode + blend to fuse organic parts; use crisp "union" for machined parts.
+- Honor shape adjectives LITERALLY: "round table top" = short cylinder (never a box); "square/rectangular" = box; "pointed" = cone; "curved handle" = torus.
 - Use symmetries aggressively for symmetric creatures (4 legs = radial count 4), plants (petals), vehicles (mirror x).
 - Pick realistic colors per part (#rrggbb hex). Crystal/gem parts can use high metalness (0.6-0.9) + low roughness (0.1-0.3).
+
+EXAMPLE — "a white coffee mug with a handle" (note the cavity + torus handle — the two features that make it a MUG):
+{"label":"coffee mug","ops":[{"prim":"cylinder","mode":"union","color":"#f5f5f0","pos":[0,-0.1,0],"r":0.5,"h":0.55},{"prim":"cylinder","mode":"subtract","color":"#f5f5f0","pos":[0,0.02,0],"r":0.43,"h":0.55},{"prim":"torus","mode":"union","color":"#f5f5f0","pos":[0.58,-0.05,0],"rot":[90,0,0],"R":0.26,"r":0.06},{"prim":"cylinder","mode":"union","color":"#efeae2","pos":[0,-0.68,0],"r":0.42,"h":0.04}],"metalness":0,"roughness":0.4}
 
 EXAMPLE — "6-petaled flower with a stem": {"label":"flower","parts":[{"name":"petal","ops":[{"prim":"ellipsoid","mode":"union","color":"#e85a9b","pos":[0,0,0],"size":[0.35,0.05,0.18]}]}],"symmetries":[{"kind":"radial","of":"petal","count":6,"radius":0.18,"axis":"y","spin":true}],"ops":[{"prim":"capsule","mode":"union","color":"#3a8a3a","pos":[0,-0.7,0],"size":[0,0.9,0],"r":0.05},{"prim":"sphere","mode":"union","color":"#dcb35c","pos":[0,0.05,0],"r":0.12}]}
 
 Reply with ONLY the JSON object for this description:`;
+
+// ——— deterministic structural validation ————————————————————————————————————
+// The cheap, model-independent accuracy backstop: if the prompt names an object
+// whose defining feature is structural (a mug's cavity, a handle's ring, a
+// table's legs), the composed program MUST contain the geometry that expresses
+// it. A weak composer + a weak QA VLM shipped a 2-op blob as "a coffee mug"
+// and PASSed it — these checks catch that in microseconds, no AI involved.
+// Findings feed ONE corrective refine round in the forge pipeline.
+
+const HOLLOW_WORDS = /\b(mug|cup|bowl|vase|pot|bucket|glass|jar|pitcher|teapot|kettle|bottle|barrel|cauldron|basket|tub)s?\b/i;
+const HANDLE_WORDS = /\bhandles?\b|\bmug\b|\bpitcher\b|\bteapot\b/i;
+const WHEEL_WORDS = /\b(wheel|tire|tyre)s?\b/i;
+const LEG_WORDS = /\b(table|chair|stool|bench|desk)\b|\blegs\b/i;
+
+export function validateProgramFeatures(prompt: string, program: ShapeProgram): string[] {
+  const findings: string[] = [];
+  const flat = flattenProgram(program);
+  const ops = flat.ops;
+  const prims = ops.map(o => o.prim);
+  const nOps = ops.length;
+
+  if (HOLLOW_WORDS.test(prompt) && !ops.some(o => o.mode === 'subtract')) {
+    findings.push('the object is a hollow container but the program has NO "subtract" op — carve the interior cavity (same shape as the body, slightly smaller, raised so the rim opens upward)');
+  }
+  if (HANDLE_WORDS.test(prompt) && !prims.includes('torus') && !ops.some(o => o.prim === 'capsule' && o.rot)) {
+    findings.push('a handle is expected but there is no torus (or bent capsule) — add a vertical torus ring at the body side, ~1/3 buried');
+  }
+  if (WHEEL_WORDS.test(prompt) && !prims.some(p => p === 'cylinder' || p === 'torus')) {
+    findings.push('wheels are expected but there are no cylinders/tori — wheels are cylinders rotated 90° so the flat faces point sideways');
+  }
+  if (LEG_WORDS.test(prompt) && nOps < 4 && !(program.symmetries?.length)) {
+    findings.push('legged furniture needs legs — add thin cylinders/capsules from the underside (use a symmetry to repeat them)');
+  }
+
+  // Global under-modeling check: multi-word object described by a near-empty program.
+  const contentWords = prompt.toLowerCase().replace(/[^a-z\s]/g, '').split(/\s+/).filter(w => w.length > 2).length;
+  if (nOps < 4 && contentWords >= 3 && !(program.assemblies?.length)) {
+    findings.push(`only ${nOps} ops for a described object — under-modeled; decompose into main mass + structural features + details (aim for 6+)`);
+  }
+  return findings;
+}
 
 // ——— two-pass compose: plan (parts on the grid) → refine (per-part ops) ———
 // Process borrowed from the owner's AssetForge factory: a planner decomposes
@@ -825,7 +918,7 @@ This is PASS 1 (layout only) — no geometry. Description:`;
 
 const REFINE_PART_INSTRUCTIONS = `PASS 2 — you are the geometry refiner of a 3D model factory. PASS 1 planned the parts below (positions/scales/motion are FIXED — do not restate them). For EACH planned part, author its SDF ops FULL-SIZE in the part's OWN local frame: pretend the part alone fills [-1.2,1.2] and its pivot (axle/shaft/hinge) is at the origin. Also author optional top-level "ops" for the static base ONLY if the plan lists no static parts.
 ${''}Use the same primitive/CSG/symmetry language as the main compiler:
-- prims: sphere(r) box(size=half-extents) ellipsoid(size) capsule(pos→pos+size,r) torus(R,r) cone(r,h) hex(size=[radial,halfH,_]) octahedron(r)
+- prims: sphere(r) box(size=half-extents) ellipsoid(size) capsule(pos→pos+size,r) cylinder(r, h=half-height — man-made round parts: wheels, shafts, cans) torus(R,r) cone(r,h) hex(size=[radial,halfH,_]) octahedron(r)
 - modes: union | smooth(blend 0.06-0.15) | subtract | intersect — ops apply in order
 - "parts"+"symmetries" DSL per assembly: e.g. a gear = hex body + {"kind":"radial","of":"tooth","count":12,"radius":0.95,"axis":"y","spin":true} over a small box tooth
 Give each part 4-10 ops (hero parts up to 16). Realistic per-part colors; metals get metalness 0.7-0.95, roughness 0.15-0.4.
@@ -835,7 +928,7 @@ Reply with ONLY JSON: {"assemblies":[{"name":"<exact planned name>","ops":[...],
  * Two-pass compose for complex/mechanical objects. Falls back to null on any
  * failure — the caller then tries the single-shot composeWithAI.
  */
-export async function composeComplexWithAI(prompt: string, refNotes?: string | null): Promise<{ program: ShapeProgram; source: 'ai' } | null> {
+export async function composeComplexWithAI(prompt: string, refNotes?: string | null): Promise<{ program: ShapeProgram; source: 'ai'; provider?: string } | null> {
   const grounding = refNotes
     ? `\nREFERENCE NOTES — consensus distilled from real photos of this object; match these parts and proportions:\n${refNotes}\n`
     : '';
@@ -890,7 +983,7 @@ export async function composeComplexWithAI(prompt: string, refNotes?: string | n
       roughness: rawPlan.roughness,
     }, prompt.slice(0, 48));
     if (program && (program.assemblies?.length ?? 0) >= 2 && totalProgramOps(program) >= 4) {
-      return { program, source: 'ai' };
+      return { program, source: 'ai', provider: refined.provider };
     }
     return null;
   } catch {
@@ -908,14 +1001,14 @@ export function wantsComplexCompose(prompt: string): boolean {
  * Compose a shape program via the AI provider chain. Returns null when no
  * provider produces one — callers fall back to buildPreviewProgram/parametric.
  */
-export async function composeWithAI(prompt: string, refNotes?: string | null): Promise<{ program: ShapeProgram; source: 'ai' } | null> {
+export async function composeWithAI(prompt: string, refNotes?: string | null): Promise<{ program: ShapeProgram; source: 'ai'; provider?: string } | null> {
   try {
     // 60 s: composing a full shape program is a long-form generation, and the
     // chain may burn seconds on a failing provider before the one that answers.
     const grounding = refNotes
       ? `\nREFERENCE NOTES — consensus distilled from real photos of this object; match these parts and proportions:\n${refNotes}\n`
       : '';
-    const { text } = await aiChatSync(
+    const { text, provider } = await aiChatSync(
       `${COMPOSE_INSTRUCTIONS}${grounding}\n\nDescription: "${prompt}"`,
       'sdf-shape-compiler',
       60000,
@@ -923,7 +1016,7 @@ export async function composeWithAI(prompt: string, refNotes?: string | null): P
     const match = text.match(/\{[\s\S]*\}/);
     if (match) {
       const program = sanitizeProgram(JSON.parse(match[0]), prompt.slice(0, 48));
-      if (program && totalProgramOps(program) >= 2) return { program, source: 'ai' };
+      if (program && totalProgramOps(program) >= 2) return { program, source: 'ai', provider };
     }
   } catch { /* no provider answered */ }
   return null;

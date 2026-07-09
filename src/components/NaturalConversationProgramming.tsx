@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   Terminal, Send, Command, Bot, Sparkles,
@@ -8,6 +8,7 @@ import {
 } from 'lucide-react';
 import Markdown from 'react-markdown';
 import type { SectionId } from '../types';
+import { aiChatSync, getPreferredProvider, setPreferredProvider, listSelectableProviders, type PreferredProvider } from '../lib/ai-providers';
 
 // Durable chat: the AI runs in a Cloudflare Workflow that survives this
 // browser closing. POST /api/chat returns an instanceId immediately; we poll
@@ -124,6 +125,15 @@ export const NaturalConversationProgramming = ({ onNavigate }: NcpProps) => {
   const [activeRun, setActiveRun] = useState<string | null>(null);
   const [runStatus, setRunStatus] = useState<string>('idle'); // idle | queued | running | paused | complete | errored
   const [isGeneratingImage, setIsGeneratingImage] = useState(false);
+  // BYO provider selection. 'auto'/'cloud' → the durable server workflow.
+  // A specific provider → DIRECT mode: the message goes straight to that
+  // provider from this browser (keys never reach our server); replies render
+  // locally and are not persisted to the durable D1 thread.
+  const [preferredProvider, setPreferredProviderState] = useState<PreferredProvider>(() => getPreferredProvider());
+  const providerOptions = useMemo(() => listSelectableProviders(), []);
+  const directMode = preferredProvider !== 'auto' && preferredProvider !== 'cloud';
+  const directProviderName = providerOptions.find(o => o.id === preferredProvider)?.name ?? 'custom provider';
+  const [isDirectBusy, setIsDirectBusy] = useState(false);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -239,7 +249,7 @@ export const NaturalConversationProgramming = ({ onNavigate }: NcpProps) => {
   };
 
   const handleSend = async () => {
-    if (!input.trim() || activeRun || isGeneratingImage) return; // don't queue two runs at once
+    if (!input.trim() || activeRun || isGeneratingImage || isDirectBusy) return; // don't queue two runs at once
     const userText = input.trim();
     setInput('');
     setError(null);
@@ -247,6 +257,37 @@ export const NaturalConversationProgramming = ({ onNavigate }: NcpProps) => {
     // Slash command: /image <prompt>
     if (userText.toLowerCase().startsWith('/image ')) {
       await generateImage(userText.slice(7).trim());
+      return;
+    }
+
+    // DIRECT mode — a specific BYO provider is selected: call it from the
+    // browser (strict — its real error surfaces), render locally.
+    if (directMode) {
+      setIsDirectBusy(true);
+      setMessages(prev => [...prev, {
+        id: `direct-user-${Date.now()}`, role: 'user', content: userText,
+        created_at: new Date().toISOString(), localOnly: true,
+      }]);
+      try {
+        // include recent turns so the provider has conversation context
+        const transcript = messages.slice(-12)
+          .map(m => `${m.role === 'user' ? 'User' : m.role === 'system' ? 'System' : 'Assistant'}: ${m.content}`)
+          .join('\n');
+        const { text, provider } = await aiChatSync(
+          transcript ? `${transcript}\nUser: ${userText}\nAssistant:` : userText,
+          'chat',
+          90000,
+        );
+        setMessages(prev => [...prev, {
+          id: `direct-ai-${Date.now()}`, role: 'ai',
+          content: `${text}\n\n<sub>*${provider} · direct — not saved to the durable thread*</sub>`,
+          created_at: new Date().toISOString(), localOnly: true,
+        }]);
+      } catch (e: any) {
+        setError(`${directProviderName}: ${e?.message || e}`);
+      } finally {
+        setIsDirectBusy(false);
+      }
       return;
     }
 
@@ -322,7 +363,7 @@ export const NaturalConversationProgramming = ({ onNavigate }: NcpProps) => {
     setTimeout(() => window.location.reload(), 100);
   };
 
-  const busy = activeRun !== null || isGeneratingImage;
+  const busy = activeRun !== null || isGeneratingImage || isDirectBusy;
   const statusLabel: Record<string, string> = {
     idle: '', queued: 'Queued…', running: 'Working…', paused: 'Needs input', complete: 'Done', errored: 'Error',
   };
@@ -340,12 +381,18 @@ export const NaturalConversationProgramming = ({ onNavigate }: NcpProps) => {
           {busy && (
             <span className="flex items-center gap-1.5 text-xs font-mono px-3 py-1 rounded-full border bg-indigo-500/10 border-indigo-500/30 text-indigo-300">
               <Loader2 className="w-3 h-3 animate-spin" />
-              {isGeneratingImage ? 'Painting…' : statusLabel[runStatus] || 'Working…'}
+              {isGeneratingImage ? 'Painting…' : isDirectBusy ? `Asking ${directProviderName.split(' ·')[0]}…` : statusLabel[runStatus] || 'Working…'}
             </span>
           )}
-          <span className="flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-1 rounded-full border bg-emerald-400/10 border-emerald-500/20 text-emerald-400" title="The AI runs in a durable Cloudflare Workflow — it keeps working after you close the tab.">
-            <Cloud className="w-3 h-3" /> DURABLE
-          </span>
+          {directMode ? (
+            <span className="flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-1 rounded-full border bg-fuchsia-400/10 border-fuchsia-500/20 text-fuchsia-300" title={`Direct mode: messages go straight to ${directProviderName} from this browser. Replies are not saved to the durable cloud thread. Switch back to Auto in the runtime panel for durable chat.`}>
+            {directProviderName.split(' ·')[0].toUpperCase()} · DIRECT
+            </span>
+          ) : (
+            <span className="flex items-center gap-1.5 text-[11px] font-mono px-2.5 py-1 rounded-full border bg-emerald-400/10 border-emerald-500/20 text-emerald-400" title="The AI runs in a durable Cloudflare Workflow — it keeps working after you close the tab.">
+              <Cloud className="w-3 h-3" /> DURABLE
+            </span>
+          )}
           <button
             onClick={clearChat}
             title="Start fresh"
@@ -372,18 +419,29 @@ export const NaturalConversationProgramming = ({ onNavigate }: NcpProps) => {
             exit={{ opacity: 0, height: 0 }}
             className="overflow-hidden border-b border-slate-800/60 bg-slate-900/40"
           >
+            <div className="px-6 pt-4 pb-1">
+              <div className="text-slate-600 uppercase tracking-wider text-[10px] mb-1 font-mono">AI provider</div>
+              <select
+                value={preferredProvider}
+                onChange={e => { setPreferredProvider(e.target.value as PreferredProvider); setPreferredProviderState(e.target.value as PreferredProvider); }}
+                title="Auto/AuraFlare Cloud = durable server workflow (survives tab close). A specific provider = direct from this browser with your key — strict, replies not saved to the cloud thread. Manage providers in Settings → AI."
+                className="w-full md:w-80 bg-slate-950 border border-slate-800 rounded px-2 py-1.5 text-xs font-mono text-slate-200 focus:outline-none focus:border-indigo-500"
+              >
+                {providerOptions.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+              </select>
+            </div>
             <div className="px-6 py-4 grid grid-cols-2 md:grid-cols-4 gap-4 text-xs font-mono">
               <div>
                 <div className="text-slate-600 uppercase tracking-wider text-[10px] mb-1">Model</div>
-                <div className="text-slate-300">kimi-k2.6 · Workers AI</div>
+                <div className="text-slate-300">{directMode ? directProviderName : 'kimi-k2.6 · Workers AI'}</div>
               </div>
               <div>
                 <div className="text-slate-600 uppercase tracking-wider text-[10px] mb-1">Execution</div>
-                <div className="text-slate-300">Durable Workflow · ≤6 turns</div>
+                <div className="text-slate-300">{directMode ? 'Direct · browser → provider' : 'Durable Workflow · ≤6 turns'}</div>
               </div>
               <div>
                 <div className="text-slate-600 uppercase tracking-wider text-[10px] mb-1">Memory</div>
-                <div className="text-slate-300">D1 · full thread persisted</div>
+                <div className="text-slate-300">{directMode ? 'local only · not persisted' : 'D1 · full thread persisted'}</div>
               </div>
               <div>
                 <div className="text-slate-600 uppercase tracking-wider text-[10px] mb-1">Images</div>

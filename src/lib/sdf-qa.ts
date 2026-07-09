@@ -10,7 +10,7 @@
  */
 import * as THREE from 'three';
 import {
-  expandProgram, refineProgramWithAI, flattenProgram,
+  expandProgram, refineProgramWithAI, flattenProgram, validateProgramFeatures,
   type Assembly, type ShapeProgram, type PrimOp,
 } from './sdf-compiler';
 import { aiChatSync } from './ai-providers';
@@ -59,6 +59,7 @@ function opRadius(op: PrimOp): number {
   if (op.size) return Math.max(Math.abs(op.size[0]), Math.abs(op.size[1]), Math.abs(op.size[2]));
   if (op.prim === 'torus') return (op.R ?? 0.5) + (op.r ?? 0.12);
   if (op.prim === 'cone') return Math.max(op.r ?? 0.3, op.h ?? 0.5);
+  if (op.prim === 'cylinder') return Math.max(op.r ?? 0.3, op.h ?? 0.4);
   return op.r ?? 0.3;
 }
 
@@ -132,28 +133,51 @@ export function lintProgram(program: ShapeProgram): string[] {
 }
 
 // ── AI critique + revision ────────────────────────────────────────────────────
+//
+// Describe-then-judge: asking a small VLM (llava-7b) for a PASS/FAIL verdict
+// rubber-stamps everything — it answered "PASS" for a featureless blob labeled
+// "coffee mug". Small VLMs can *describe* far more reliably than they can
+// *judge*, so the vision step only reports what the render actually shows, and
+// the (much stronger) text model compares that against the request.
 
-const CRITIQUE_PROMPT = `You are the QA inspector of a 3D model factory. The image is a render of a procedurally generated model. Judge it against the request and list ONLY concrete, fixable defects — wrong proportions, missing or invisible parts, parts floating disconnected, moving parts hidden inside the body, too little surface detail. If it faithfully represents the request, reply exactly PASS. Otherwise reply with at most 5 terse numbered defects (no praise, no prose).`;
+const DESCRIBE_RENDER_PROMPT = `Describe the object in this 3D render, literally and only what is visible: overall shape (e.g. "a rounded blob", "a cylinder with a ring on the side"), each distinct part you can see, and the colors. Do NOT guess what it is supposed to be. 2-3 terse sentences.`;
 
-async function critiqueWithVision(promptText: string, snapshot: string): Promise<string | null> {
+async function describeRender(snapshot: string): Promise<string | null> {
   try {
     const res = await fetch('/api/media/describe', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ image: snapshot, prompt: `${CRITIQUE_PROMPT}\n\nTHE REQUEST: "${promptText}"` }),
+      body: JSON.stringify({ image: snapshot, prompt: DESCRIBE_RENDER_PROMPT }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || data.error) return null;
-    return String(data.description ?? '').trim() || null;
+    const desc = String(data.description ?? '').trim();
+    // A weak VLM sometimes parrots the question's category words back as a
+    // list ("1. Shape, 2. Parts, ..."). That is noise, not a description.
+    if (!desc || (/^\s*\d+\./.test(desc) && !/\b(cylind|round|sphere|box|cube|ring|cone|flat|blob|tall|wide|curved)\w*/i.test(desc))) return null;
+    return desc;
   } catch {
     return null;
   }
 }
 
-async function critiqueTextOnly(promptText: string, program: ShapeProgram): Promise<string | null> {
+/** One text-LLM judgement fusing everything we know: request, reference
+ * consensus, what a vision model saw in the render, and the program itself. */
+async function critiqueFused(
+  promptText: string,
+  program: ShapeProgram,
+  renderDescription: string | null,
+  refNotes?: string | null,
+): Promise<string | null> {
   try {
+    const sections = [
+      `THE REQUEST: "${promptText}"`,
+      refNotes ? `REFERENCE CONSENSUS (distilled from real photos — the model must match these parts/proportions):\n${refNotes}` : '',
+      renderDescription ? `WHAT THE RENDER ACTUALLY SHOWS (independent vision model, describing literally):\n${renderDescription}` : '',
+      `THE SHAPE-PROGRAM JSON:\n${JSON.stringify(program)}`,
+    ].filter(Boolean).join('\n\n');
     const { text } = await aiChatSync(
-      `You are the QA inspector of a 3D model factory. Below is the shape-program JSON for the request "${promptText}". List ONLY concrete defects (bad proportions vs reality, missing canonical parts, moving parts that can't be seen, motion specs that make no mechanical sense). Reply exactly PASS if acceptable, else at most 5 terse numbered defects.\n\n${JSON.stringify(program)}`,
+      `You are the QA inspector of a 3D model factory. Judge whether the generated model faithfully represents the request. Weigh the render description heavily: if it reads as a shapeless blob or is missing a defining part the request names (a mug's cavity or handle, a table's legs, wheels), that is a defect. List ONLY concrete fixable defects — wrong proportions, missing/invisible parts, floating parts, motion that makes no mechanical sense. Reply exactly PASS if faithful, else at most 5 terse numbered defects (no praise, no prose).\n\n${sections}`,
       'sdf-qa-critique',
       45000,
     );
@@ -180,15 +204,13 @@ export async function qaReviewProgram(
   refNotes?: string | null,
 ): Promise<QAResult> {
   const findings = lintProgram(program);
+  // Structural backstop: prompt-implied features (cavity, handle, wheels, legs)
+  // must exist in the geometry — catches blob-ships no matter how weak the VLM.
+  findings.push(...validateProgramFeatures(promptText, program));
 
-  // The "average of photos" grounding: judge the render against the consensus
-  // reference notes, not just the prompt text.
-  const target = refNotes
-    ? `${promptText}"\nREFERENCE CONSENSUS (from real photos — the render must match these parts/proportions):\n${refNotes}\n"`
-    : promptText;
   const snapshot = renderSnapshot(compiledGroup);
-  const critique = snapshot ? await critiqueWithVision(target, snapshot) : null;
-  const aiCritique = critique ?? await critiqueTextOnly(target, program);
+  const renderDescription = snapshot ? await describeRender(snapshot) : null;
+  const aiCritique = await critiqueFused(promptText, program, renderDescription, refNotes);
   if (aiCritique && !/^\s*PASS\b/i.test(aiCritique)) {
     for (const line of aiCritique.split('\n').map(s => s.trim()).filter(s => /^\d/.test(s)).slice(0, 5)) {
       findings.push(line);
@@ -199,7 +221,7 @@ export async function qaReviewProgram(
 
   const revised = await refineProgramWithAI(
     program,
-    `QA found these defects — fix ALL of them, keep everything that already works, aim for maximum believable detail and correct rigging: ${findings.join('; ')}`,
+    `QA found these defects — fix them with MINIMAL edits: change only the ops the defects require, do NOT add unrelated shapes, do NOT restructure parts that already work, keep every color/material choice. Defects: ${findings.join('; ')}`,
   );
   return revised
     ? { program: revised, verdict: 'revised', findings }

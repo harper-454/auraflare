@@ -140,6 +140,17 @@ function emitOpBlock(op: PrimOp, isFirst: boolean): string {
       break;
     }
 
+    case 'cylinder': {
+      // capped cylinder along Y: r = radius, h = half-height (matches CPU/WGSL)
+      const r = op.r ?? 0.3, h = op.h ?? 0.4;
+      lines.push(
+        `float cyd = sqrt(lp.x*lp.x + lp.z*lp.z) - ${f(r)};`,
+        `float cyy = abs(lp.y) - ${f(h)};`,
+        `float di = min(max(cyd, cyy), 0.0) + length(max(vec2(cyd, cyy), vec2(0.0)));`,
+      );
+      break;
+    }
+
     default:
       lines.push(`float di = 1e9;`);
   }

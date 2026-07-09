@@ -15,7 +15,7 @@
 import * as THREE from 'three';
 import {
   composeWithAI, composeComplexWithAI, wantsComplexCompose, buildPreviewProgram,
-  sanitizeProgram, type ShapeProgram,
+  sanitizeProgram, validateProgramFeatures, refineProgramWithAI, type ShapeProgram,
 } from './sdf-compiler';
 import { compileProgramAuto } from './sdf-gpu';
 import { compileAssemblies, type Animator } from './sdf-assembly';
@@ -49,6 +49,7 @@ export interface ForgeResult {
   moving?: number;
   qa?: 'passed' | 'revised' | 'skipped';
   ref?: string;
+  provider?: string;
   qaFindings: string[];
 }
 
@@ -151,6 +152,22 @@ export async function forgeModel(
   let program = composed?.program ?? buildPreviewProgram(prompt);
   if (!program) throw new Error('no composer produced a program');
 
+  // Structural backstop — runs even in fast mode (costs nothing unless it
+  // fails). If the prompt names features the geometry doesn't express (a mug
+  // with no cavity, a table with no legs), do ONE corrective refine with the
+  // precise findings. This is what keeps a 2-op blob from shipping as "a mug".
+  if (composed) {
+    const structural = validateProgramFeatures(prompt, program);
+    if (structural.length) {
+      const fixed = await refineProgramWithAI(
+        program,
+        `The program is structurally wrong for the request — fix ALL of these while keeping everything that already works: ${structural.join('; ')}`,
+      ).catch(() => null);
+      // accept the revision only if it actually resolves findings
+      if (fixed && validateProgramFeatures(prompt, fixed).length < structural.length) program = fixed;
+    }
+  }
+
   onStage?.('compiling');
   let compiled = await compileAnyProgram(program);
 
@@ -182,7 +199,7 @@ export async function forgeModel(
     triangles: compiled.triangles, opCount: compiled.opCount, backend: compiled.backend,
     resolution: compiled.resolution, fieldMs: compiled.fieldMs,
     parts: compiled.parts, moving: compiled.moving,
-    qa: verdict, ref: refInfo, qaFindings,
+    qa: verdict, ref: refInfo, provider: composed?.provider, qaFindings,
   };
 }
 
