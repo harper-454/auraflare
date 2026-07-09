@@ -17,6 +17,18 @@
 
 **Also in this tree (built by a parallel session, verified here):** MASTERPLAN 3D-2 — `SDFRaytracer.tsx` + `sdf-glsl.ts` live sphere-traced preview while typing (PREVIEWING state), and `buildPreviewProgram` (deterministic keyword composer) with `scripts/test-10models.ts` — 10/10 novel prompts pass offline.
 
+## 2026-07-08 fifth pass — reference grounding + Batch Forge (the credit saver)
+
+Owner directives: "it must get an average of photos pulled online or generated images if not online" and "something next level to get us generating stuff, this back and forth is burning credits."
+
+**Reference grounding** (`src/lib/sdf-reference.ts`): before composing, search Wikimedia Commons (keyless, CORS-safe, openly licensed) with a search-term ladder (full noun phrase → last 3/2/1 content words — the full prompt returns 0 results, "pocket watch" returns 10), tile up to 4 photos into a contact sheet, and have the VLM distill the CONSENSUS ("average of photos") into terse reference notes that anchor the plan pass, the geometry pass, and the QA critique. Falls back to SDXL-generated reference views when the web has nothing, `mode:'none'` when offline. HUD shows `refs online · 4 photos`; REFERENCING status while it runs. Dev `/api/media/describe` now proxies to prod when local Gemini fails (same pattern as chat-sync).
+
+**Batch Forge** (`src/lib/forge-pipeline.ts` + `src/components/BatchForgePanel.tsx`): the whole pipeline factored into one reusable module (`forgeModel(prompt, opts, onStage)`) shared by the interactive viewport, the batch queue, the cache, and gallery reloads. The panel (layers button, bottom-left of the 3D Studio) queues up to 12 prompts and runs the grounded factory per prompt unattended; **fast mode** (default) skips QA to halve per-model AI calls. Every model persists to the media gallery (R2 prod / disk dev): animated `.glb` + snapshot `.jpg` + program/stats/QA `.json`. The **program cache** (localStorage, 48 entries) makes any repeated prompt — and any library Load — recompile from the stored ShapeProgram with **ZERO AI calls**. Verified: 2-model batch (desk fan, water wheel — both articulated, 1 moving part each) forged + saved; identical batch re-run completed **from cache in ~1 s**; library reload in **0.6 s** (`source: cached`). Gotcha fixed en route: the dev server's global `express.json()` swallowed `application/json` PUT bodies before the raw media handler — gallery manifests now upload as `application/octet-stream`.
+
+Economics: a fresh grounded+QA'd model ≈ 4-6 AI calls; fast mode ≈ 2-3; cached/library ≈ 0. The library means generations accumulate instead of evaporating — the "constant back and forth" is replaced by queue → walk away → review the gallery.
+
+---
+
 ## 2026-07-08 fourth pass — moving parts, the factory pipeline, and self-QA
 
 Owner directive: complex multi-part models with FUNCTION — a watch with gears and hands, an engine with working pistons — plus a coarse-to-fine process (lay parts out on a grid, then refine) and a pre-delivery self-review. Process patterns were mined from the owner's **AssetForge** project (C:\Users\alexh\Developer\AssetForge): planner-owns-decomposition, category part-priors with roles, rig plan before build, QA as promotion blocker.

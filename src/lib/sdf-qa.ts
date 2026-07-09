@@ -177,12 +177,18 @@ export async function qaReviewProgram(
   promptText: string,
   program: ShapeProgram,
   compiledGroup: THREE.Group,
+  refNotes?: string | null,
 ): Promise<QAResult> {
   const findings = lintProgram(program);
 
+  // The "average of photos" grounding: judge the render against the consensus
+  // reference notes, not just the prompt text.
+  const target = refNotes
+    ? `${promptText}"\nREFERENCE CONSENSUS (from real photos — the render must match these parts/proportions):\n${refNotes}\n"`
+    : promptText;
   const snapshot = renderSnapshot(compiledGroup);
-  const critique = snapshot ? await critiqueWithVision(promptText, snapshot) : null;
-  const aiCritique = critique ?? await critiqueTextOnly(promptText, program);
+  const critique = snapshot ? await critiqueWithVision(target, snapshot) : null;
+  const aiCritique = critique ?? await critiqueTextOnly(target, program);
   if (aiCritique && !/^\s*PASS\b/i.test(aiCritique)) {
     for (const line of aiCritique.split('\n').map(s => s.trim()).filter(s => /^\d/.test(s)).slice(0, 5)) {
       findings.push(line);

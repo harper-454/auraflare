@@ -252,7 +252,20 @@ User Query: ${message}
       });
       res.json({ ok: true, description: response.text, model: 'gemini-3.1-pro-preview' });
     } catch (error: any) {
-      res.status(500).json({ error: error.message || 'vision error' });
+      // Same resilience as /api/chat-sync: when local Gemini is unavailable,
+      // proxy to the production Worker's VLM so vision keeps working in dev.
+      try {
+        const proxied = await fetch(`${PROD_ORIGIN}/api/media/describe`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(req.body),
+        });
+        const data: any = await proxied.json();
+        if (!proxied.ok || data.error) throw new Error(data.error || `proxy ${proxied.status}`);
+        res.json({ ...data, fallback: 'prod-proxy' });
+      } catch (proxyErr: any) {
+        res.status(500).json({ error: `${error.message || 'vision error'}; prod proxy: ${proxyErr.message}` });
+      }
     }
   });
 
@@ -263,7 +276,8 @@ User Query: ${message}
     try {
       await fs.promises.mkdir(GALLERY_DIR, { recursive: true });
       const files = await fs.promises.readdir(GALLERY_DIR);
-      const items = await Promise.all(files.filter(f => f.endsWith('.glb')).map(async f => {
+      // .glb (models/exports) + .json/.jpg (Batch Forge artifacts)
+      const items = await Promise.all(files.filter(f => /\.(glb|json|jpg)$/.test(f)).map(async f => {
         const st = await fs.promises.stat(path.join(GALLERY_DIR, f));
         return { key: f, size: st.size, uploaded: st.mtime.toISOString() };
       }));

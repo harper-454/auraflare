@@ -835,9 +835,12 @@ Reply with ONLY JSON: {"assemblies":[{"name":"<exact planned name>","ops":[...],
  * Two-pass compose for complex/mechanical objects. Falls back to null on any
  * failure — the caller then tries the single-shot composeWithAI.
  */
-export async function composeComplexWithAI(prompt: string): Promise<{ program: ShapeProgram; source: 'ai' } | null> {
+export async function composeComplexWithAI(prompt: string, refNotes?: string | null): Promise<{ program: ShapeProgram; source: 'ai' } | null> {
+  const grounding = refNotes
+    ? `\nREFERENCE NOTES — consensus distilled from real photos of this object; match these parts and proportions:\n${refNotes}\n`
+    : '';
   try {
-    const plan = await aiChatSync(`${PLAN_INSTRUCTIONS} "${prompt}"`, 'sdf-shape-compiler-plan', 60000);
+    const plan = await aiChatSync(`${PLAN_INSTRUCTIONS}${grounding} "${prompt}"`, 'sdf-shape-compiler-plan', 60000);
     const planMatch = plan.text.match(/\{[\s\S]*\}/);
     if (!planMatch) return null;
     const rawPlan = JSON.parse(planMatch[0]);
@@ -848,7 +851,7 @@ export async function composeComplexWithAI(prompt: string): Promise<{ program: S
       `- name:"${String(p.name || '')}" role:"${String(p.role || '')}" shape-hint:"${String(p.hint || '')}" color:${p.color || '#7b8cfa'}${p.moving ? ` MOVING(${p.moving.kind} ${p.moving.axis})` : ' static'}`,
     ).join('\n');
     const refined = await aiChatSync(
-      `${REFINE_PART_INSTRUCTIONS}\n\nOBJECT: "${prompt}" (${String(rawPlan.label || '')}, category ${String(rawPlan.category || 'other')})\nPLANNED PARTS:\n${partList}`,
+      `${REFINE_PART_INSTRUCTIONS}${grounding}\n\nOBJECT: "${prompt}" (${String(rawPlan.label || '')}, category ${String(rawPlan.category || 'other')})\nPLANNED PARTS:\n${partList}`,
       'sdf-shape-compiler-refine-pass',
       90000,
     );
@@ -905,12 +908,15 @@ export function wantsComplexCompose(prompt: string): boolean {
  * Compose a shape program via the AI provider chain. Returns null when no
  * provider produces one — callers fall back to buildPreviewProgram/parametric.
  */
-export async function composeWithAI(prompt: string): Promise<{ program: ShapeProgram; source: 'ai' } | null> {
+export async function composeWithAI(prompt: string, refNotes?: string | null): Promise<{ program: ShapeProgram; source: 'ai' } | null> {
   try {
     // 60 s: composing a full shape program is a long-form generation, and the
     // chain may burn seconds on a failing provider before the one that answers.
+    const grounding = refNotes
+      ? `\nREFERENCE NOTES — consensus distilled from real photos of this object; match these parts and proportions:\n${refNotes}\n`
+      : '';
     const { text } = await aiChatSync(
-      `${COMPOSE_INSTRUCTIONS}\n\nDescription: "${prompt}"`,
+      `${COMPOSE_INSTRUCTIONS}${grounding}\n\nDescription: "${prompt}"`,
       'sdf-shape-compiler',
       60000,
     );
