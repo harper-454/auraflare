@@ -12,6 +12,8 @@
  * Fully deterministic, fully local, no ML weights, no paid APIs.
  */
 import * as THREE from 'three';
+import { makeSDFMaterial } from './sdf-material';
+import { aiChatSync } from './ai-providers';
 
 export type PrimKind = 'sphere' | 'box' | 'capsule' | 'torus' | 'ellipsoid' | 'cone' | 'hex' | 'octahedron';
 export type CsgMode = 'union' | 'smooth' | 'subtract' | 'intersect';
@@ -514,12 +516,7 @@ export function polygonizeField(program: ShapeProgram, field: Float32Array, reso
   geo.setAttribute('normal', new THREE.BufferAttribute(normArr, 3));
   geo.setAttribute('color', new THREE.BufferAttribute(colorArr, 3));
 
-  const material = new THREE.MeshStandardMaterial({
-    vertexColors: true,
-    metalness: program.metalness ?? 0.15,
-    roughness: program.roughness ?? 0.55,
-    side: THREE.DoubleSide,
-  });
+  const material = makeSDFMaterial({ metalness: program.metalness, roughness: program.roughness });
 
   const mesh = new THREE.Mesh(geo, material);
   mesh.name = program.label || 'sdf-model';
@@ -531,119 +528,9 @@ export function polygonizeField(program: ShapeProgram, field: Float32Array, reso
 }
 
 // ——— built-in preset programs (offline mode + few-shot examples) ———
-export const PRESET_PROGRAMS: Record<string, ShapeProgram> = {
-  snowman: {
-    label: 'snowman',
-    roughness: 0.7,
-    ops: [
-      { prim: 'sphere', mode: 'union', color: '#e8ecf4', pos: [0, -0.55, 0], r: 0.5 },
-      { prim: 'sphere', mode: 'smooth', blend: 0.1, color: '#e8ecf4', pos: [0, 0.1, 0], r: 0.36 },
-      { prim: 'sphere', mode: 'smooth', blend: 0.08, color: '#e8ecf4', pos: [0, 0.62, 0], r: 0.26 },
-      { prim: 'ellipsoid', mode: 'union', color: '#cc824a', pos: [0, 0.62, 0.33], size: [0.05, 0.05, 0.16] },
-      { prim: 'sphere', mode: 'union', color: '#1a1e28', pos: [-0.09, 0.7, 0.22], r: 0.035 },
-      { prim: 'sphere', mode: 'union', color: '#1a1e28', pos: [0.09, 0.7, 0.22], r: 0.035 },
-      { prim: 'box', mode: 'union', color: '#1a1e28', pos: [0, 0.88, 0], size: [0.28, 0.02, 0.28] },
-      { prim: 'box', mode: 'union', color: '#1a1e28', pos: [0, 1.02, 0], size: [0.16, 0.14, 0.16] },
-    ],
-  },
-  rocket: {
-    label: 'rocket ship',
-    metalness: 0.6,
-    roughness: 0.35,
-    ops: [
-      { prim: 'capsule', mode: 'union', color: '#c6ccda', pos: [0, -0.7, 0], size: [0, 1.3, 0], r: 0.3 },
-      { prim: 'ellipsoid', mode: 'smooth', blend: 0.08, color: '#d5687f', pos: [0, 0.75, 0], size: [0.24, 0.42, 0.24] },
-      { prim: 'sphere', mode: 'union', color: '#43a8ca', pos: [0, 0.05, 0.27], r: 0.1 },
-      { prim: 'box', mode: 'union', color: '#d5687f', pos: [0, -0.75, 0], rot: [0, 0, 0], size: [0.62, 0.28, 0.045] },
-      { prim: 'box', mode: 'union', color: '#d5687f', pos: [0, -0.75, 0], rot: [0, 90, 0], size: [0.62, 0.28, 0.045] },
-      { prim: 'torus', mode: 'union', color: '#8b94a7', pos: [0, -1.02, 0], R: 0.2, r: 0.07 },
-    ],
-  },
-  mushroom: {
-    label: 'mushroom house',
-    roughness: 0.65,
-    ops: [
-      { prim: 'capsule', mode: 'union', color: '#e6dfc9', pos: [0, -0.9, 0], size: [0, 0.85, 0], r: 0.38 },
-      { prim: 'ellipsoid', mode: 'smooth', blend: 0.1, color: '#d5687f', pos: [0, 0.25, 0], size: [0.85, 0.5, 0.85] },
-      { prim: 'sphere', mode: 'union', color: '#e8ecf4', pos: [0.4, 0.42, 0.55], r: 0.1 },
-      { prim: 'sphere', mode: 'union', color: '#e8ecf4', pos: [-0.5, 0.5, 0.3], r: 0.13 },
-      { prim: 'sphere', mode: 'union', color: '#e8ecf4', pos: [0.1, 0.55, -0.6], r: 0.11 },
-      { prim: 'box', mode: 'subtract', color: '#5a4634', pos: [0, -0.72, 0.36], size: [0.16, 0.24, 0.2] },
-      { prim: 'sphere', mode: 'union', color: '#dcb35c', pos: [0.28, -0.62, 0.3], r: 0.045 },
-    ],
-  },
-  dragon: {
-    label: 'baby dragon',
-    roughness: 0.5,
-    ops: [
-      { prim: 'capsule', mode: 'union', color: '#43b384', pos: [-0.5, -0.3, 0], size: [0.95, 0.25, 0], r: 0.26 },
-      { prim: 'capsule', mode: 'smooth', blend: 0.12, color: '#43b384', pos: [0.45, -0.05, 0], size: [0.3, 0.35, 0], r: 0.16 },
-      { prim: 'ellipsoid', mode: 'smooth', blend: 0.08, color: '#43b384', pos: [0.85, 0.42, 0], size: [0.26, 0.2, 0.2] },
-      { prim: 'ellipsoid', mode: 'smooth', blend: 0.06, color: '#5fc99a', pos: [1.08, 0.36, 0], size: [0.14, 0.09, 0.11] },
-      { prim: 'sphere', mode: 'union', color: '#1a1e28', pos: [0.95, 0.52, 0.13], r: 0.035 },
-      { prim: 'sphere', mode: 'union', color: '#1a1e28', pos: [0.95, 0.52, -0.13], r: 0.035 },
-      { prim: 'ellipsoid', mode: 'union', color: '#dcb35c', pos: [0.78, 0.62, 0.07], rot: [0, 0, -25], size: [0.035, 0.12, 0.035] },
-      { prim: 'ellipsoid', mode: 'union', color: '#dcb35c', pos: [0.78, 0.62, -0.07], rot: [0, 0, -25], size: [0.035, 0.12, 0.035] },
-      { prim: 'ellipsoid', mode: 'union', color: '#3caca4', pos: [-0.1, 0.25, 0.3], rot: [30, 0, 20], size: [0.4, 0.02, 0.22] },
-      { prim: 'ellipsoid', mode: 'union', color: '#3caca4', pos: [-0.1, 0.25, -0.3], rot: [-30, 0, 20], size: [0.4, 0.02, 0.22] },
-      { prim: 'capsule', mode: 'smooth', blend: 0.1, color: '#43b384', pos: [-1.3, -0.25, 0], size: [-0.5, 0.35, 0], r: 0.08 },
-      { prim: 'capsule', mode: 'union', color: '#43b384', pos: [-0.25, -0.55, 0.18], size: [0, -0.3, 0], r: 0.08 },
-      { prim: 'capsule', mode: 'union', color: '#43b384', pos: [-0.25, -0.55, -0.18], size: [0, -0.3, 0], r: 0.08 },
-      { prim: 'capsule', mode: 'union', color: '#43b384', pos: [0.35, -0.55, 0.16], size: [0, -0.3, 0], r: 0.08 },
-      { prim: 'capsule', mode: 'union', color: '#43b384', pos: [0.35, -0.55, -0.16], size: [0, -0.3, 0], r: 0.08 },
-    ],
-  },
-  crystal: {
-    // Showcases: new octahedron + cone primitives, radial symmetry DSL,
-    // high metalness gem material. Generated from 3 authored ops + 1 symmetry.
-    label: 'crystal cluster',
-    metalness: 0.85,
-    roughness: 0.15,
-    parts: [
-      { name: 'shard', ops: [
-        // Authored at the origin; the radial symmetry's `radius` places the
-        // ring. (Previously pre-offset in z to mask the old translate-along-axis
-        // bug, which also lifted shards +0.5 in Y and clipped them at the bound.)
-        { prim: 'octahedron', mode: 'union', color: '#7b6cf0', pos: [0, 0.45, 0], r: 0.16 },
-        { prim: 'cone', mode: 'union', color: '#9a8af5', pos: [0, 0.7, 0], r: 0.07, h: 0.35 },
-      ] },
-    ],
-    symmetries: [
-      { kind: 'radial', of: 'shard', count: 5, radius: 0.5, axis: 'y', spin: true },
-    ],
-    ops: [
-      { prim: 'octahedron', mode: 'union', color: '#5a4ad6', pos: [0, -0.35, 0], r: 0.42 },
-      { prim: 'hex', mode: 'union', color: '#3a2e7a', pos: [0, -0.7, 0], size: [0.55, 0.12, 0.55] },
-    ],
-  },
-  flower: {
-    // Showcases: radial symmetry for petals, ellipsoid thin-form for petal shape.
-    label: 'six-petal flower',
-    roughness: 0.6,
-    parts: [
-      { name: 'petal', ops: [
-        // Canonical DSL usage: part authored at the origin, ring placed by `radius`.
-        { prim: 'ellipsoid', mode: 'union', color: '#e85a9b', pos: [0, 0.05, 0], rot: [0, 0, -15], size: [0.32, 0.04, 0.16] },
-      ] },
-    ],
-    symmetries: [
-      { kind: 'radial', of: 'petal', count: 6, radius: 0.42, axis: 'y', spin: true },
-    ],
-    ops: [
-      { prim: 'capsule', mode: 'union', color: '#3a8a3a', pos: [0, -0.65, 0], size: [0, 0.85, 0], r: 0.045 },
-      { prim: 'sphere', mode: 'union', color: '#dcb35c', pos: [0, 0.05, 0], r: 0.13 },
-    ],
-  },
-};
-
-const PRESET_KEYWORDS: Record<string, string[]> = {
-  snowman: ['snowman', 'snow man', 'frosty'],
-  rocket: ['rocket', 'spaceship', 'space ship', 'missile'],
-  mushroom: ['mushroom house', 'mushroom home', 'toadstool'],
-  dragon: ['dragon', 'wyvern', 'drake'],
-  crystal: ['crystal', 'gem', 'diamond cluster', 'amethyst'],
-  flower: ['flower', 'daisy', 'sunflower', 'tulip', 'rose'],
-};
+// (The old hand-authored preset library is gone — every model is now composed,
+// either by the AI provider chain or by buildPreviewProgram's heuristics. The
+// former presets live on only as polygonizer fixtures in scripts/smoke-3d.ts.)
 
 // ——— sanitizer for LLM-emitted programs ———
 const PRIMS: PrimKind[] = ['sphere', 'box', 'capsule', 'torus', 'ellipsoid', 'cone', 'hex', 'octahedron'];
@@ -766,37 +653,24 @@ EXAMPLE — "6-petaled flower with a stem": {"label":"flower","parts":[{"name":"
 Reply with ONLY the JSON object for this description:`;
 
 /**
- * Compose a shape program: LLM first, preset library as offline fallback.
- * Returns null when neither produces a program (caller falls back to parametric).
+ * Compose a shape program via the AI provider chain. Returns null when no
+ * provider produces one — callers fall back to buildPreviewProgram/parametric.
  */
-export async function composeWithAI(prompt: string): Promise<{ program: ShapeProgram; source: 'ai' | 'preset' } | null> {
+export async function composeWithAI(prompt: string): Promise<{ program: ShapeProgram; source: 'ai' } | null> {
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 20000);
-    const res = await fetch('/api/chat-sync', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      body: JSON.stringify({
-        context: 'sdf-shape-compiler',
-        message: `${COMPOSE_INSTRUCTIONS}\n\nDescription: "${prompt}"`,
-      }),
-    });
-    clearTimeout(timer);
-    if (res.ok) {
-      const data = await res.json();
-      const match = String(data.text ?? '').match(/\{[\s\S]*\}/);
-      if (match) {
-        const program = sanitizeProgram(JSON.parse(match[0]), prompt.slice(0, 48));
-        if (program && program.ops.length >= 2) return { program, source: 'ai' };
-      }
+    // 60 s: composing a full shape program is a long-form generation, and the
+    // chain may burn seconds on a failing provider before the one that answers.
+    const { text } = await aiChatSync(
+      `${COMPOSE_INSTRUCTIONS}\n\nDescription: "${prompt}"`,
+      'sdf-shape-compiler',
+      60000,
+    );
+    const match = text.match(/\{[\s\S]*\}/);
+    if (match) {
+      const program = sanitizeProgram(JSON.parse(match[0]), prompt.slice(0, 48));
+      if (program && program.ops.length >= 2) return { program, source: 'ai' };
     }
-  } catch { /* fall through to presets */ }
-
-  const p = prompt.toLowerCase();
-  for (const [key, words] of Object.entries(PRESET_KEYWORDS)) {
-    if (words.some(w => p.includes(w))) return { program: PRESET_PROGRAMS[key], source: 'preset' };
-  }
+  } catch { /* no provider answered */ }
   return null;
 }
 /**
@@ -805,21 +679,12 @@ export async function composeWithAI(prompt: string): Promise<{ program: ShapePro
  */
 export async function refineProgramWithAI(current: ShapeProgram, instruction: string): Promise<ShapeProgram | null> {
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 20000);
-    const res = await fetch('/api/chat-sync', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      body: JSON.stringify({
-        context: 'sdf-shape-compiler-refine',
-        message: `${COMPOSE_INSTRUCTIONS}\n\nCURRENT PROGRAM:\n${JSON.stringify(current)}\n\nApply this modification and reply with ONLY the complete updated JSON program: "${instruction}"`,
-      }),
-    });
-    clearTimeout(timer);
-    if (!res.ok) return null;
-    const data = await res.json();
-    const match = String(data.text ?? '').match(/\{[\s\S]*\}/);
+    const { text } = await aiChatSync(
+      `${COMPOSE_INSTRUCTIONS}\n\nCURRENT PROGRAM:\n${JSON.stringify(current)}\n\nApply this modification and reply with ONLY the complete updated JSON program: "${instruction}"`,
+      'sdf-shape-compiler-refine',
+      60000,
+    );
+    const match = text.match(/\{[\s\S]*\}/);
     if (!match) return null;
     const program = sanitizeProgram(JSON.parse(match[0]), current.label);
     return program && program.ops.length >= 2 ? program : null;
@@ -828,3 +693,500 @@ export async function refineProgramWithAI(current: ShapeProgram, instruction: st
   }
 }
 // (2026-07-06 audit pass: radial-symmetry placement + GPU expansion fixes verified by smoke test)
+
+// ——— live preview: fresh ShapeProgram from text (no preset lookup) ——————————
+
+/**
+ * Build a ShapeProgram from the user's prompt text using keyword heuristics —
+ * no preset library, always a fresh construction.  Used by the raymarch live
+ * preview so the canvas shows something relevant as the user types, before the
+ * AI compose call returns.
+ *
+ * Returns null when the text is too short or contains no recognisable shape
+ * intent (caller can keep the previous preview or show the fallback rig).
+ */
+export function buildPreviewProgram(text: string): ShapeProgram | null {
+  const t = text.toLowerCase().trim();
+  if (t.length < 3) return null;
+
+  // ── colour extraction ──────────────────────────────────────────────────────
+  const COLOR_MAP: Record<string, string> = {
+    red: '#d94040', orange: '#e07630', yellow: '#d9c440', green: '#3da854',
+    blue: '#3a6ed9', purple: '#7b55d9', pink: '#d94ea5', white: '#e8e8ec',
+    black: '#1a1a20', grey: '#808090', gray: '#808090', silver: '#aab0bf',
+    gold: '#c9a940', brown: '#8a5c30', teal: '#3abcac', cyan: '#30bcd9',
+    indigo: '#5060d9', violet: '#8040d9', magenta: '#c040c0', rose: '#e04065',
+    amber: '#d98020', lime: '#82d930', coral: '#e05040', slate: '#5a6880',
+  };
+  let baseColor = '#7b8cfa';
+  for (const [word, hex] of Object.entries(COLOR_MAP)) {
+    if (t.includes(word)) { baseColor = hex; break; }
+  }
+  // metallic/gem materials
+  const metalness = /metal|steel|iron|chrome|copper|gold|silver|titanium|shiny/.test(t) ? 0.75 : 0.15;
+  const roughness = /rough|matte|stone|rock|wood|bark|clay/.test(t) ? 0.8
+    : /glass|mirror|smooth|polished|crystal|gem|glossy/.test(t) ? 0.12 : 0.55;
+
+  // ── size hints ─────────────────────────────────────────────────────────────
+  const scale = /giant|huge|enormous|massive|big|large/.test(t) ? 1.25
+    : /tiny|small|mini|little/.test(t) ? 0.65 : 1.0;
+  const tall  = /tall|tower|pillar|spike|needle|thin|elongated/.test(t);
+  const wide  = /wide|flat|disc|disk|plate|squat/.test(t);
+
+  // ── helper to scale a position/size ───────────────────────────────────────
+  const sc = (v: number) => parseFloat((v * scale).toFixed(4));
+  const sv3 = (a: number, b: number, c: number): [number,number,number] =>
+    [sc(a), sc(b), sc(c)];
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Shape families — build ops from scratch for each recognised category.
+  // Each branch constructs a ShapeProgram with at least 2 ops so the raymarcher
+  // has something interesting to show.  Colours are tinted by baseColor.
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // ── torus / ring / donut ───────────────────────────────────────────────────
+  if (/torus|ring|donut|doughnut|bagel/.test(t)) {
+    return {
+      label: t.slice(0, 32),
+      metalness, roughness,
+      ops: [
+        { prim: 'torus',  mode: 'union', color: baseColor,  pos: [0,0,0], R: sc(0.55), r: sc(0.18) },
+        { prim: 'sphere', mode: 'smooth', blend: 0.06, color: baseColor + 'cc', pos: [sc(0.55),0,0], r: sc(0.1) },
+      ],
+    };
+  }
+
+  // ── gem / crystal / diamond / jewel ───────────────────────────────────────
+  if (/gem|diamond|jewel|faceted|amethyst|sapphire|emerald|ruby/.test(t)) {
+    const gc = baseColor === '#7b8cfa' ? '#9a7de8' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      metalness: Math.max(metalness, 0.7),
+      roughness: Math.min(roughness, 0.2),
+      ops: [
+        { prim: 'octahedron', mode: 'union',  color: gc,       pos: [0, sc(0.05), 0], r: sc(0.45) },
+        { prim: 'cone',       mode: 'union',  color: gc+'bb',  pos: [0, sc(0.35), 0], r: sc(0.28), h: sc(0.45) },
+        { prim: 'hex',        mode: 'union',  color: gc+'88',  pos: [0, sc(-0.38), 0], size: [sc(0.38), sc(0.08), sc(0.38)] },
+      ],
+    };
+  }
+
+  // ── capsule / pill / cylinder / pillar / column ───────────────────────────
+  if (/capsule|pill|cylinder|pillar|column|tube|barrel/.test(t)) {
+    const h = tall ? 1.1 : wide ? 0.35 : 0.7;
+    return {
+      label: t.slice(0, 32),
+      metalness, roughness,
+      ops: [
+        { prim: 'capsule', mode: 'union', color: baseColor, pos: [0, sc(-h*0.5), 0], size: [0, sc(h), 0], r: sc(wide ? 0.45 : 0.28) },
+        { prim: 'torus',   mode: 'union', color: baseColor, pos: [0, 0, 0], R: sc(wide ? 0.45 : 0.28), r: sc(0.06) },
+      ],
+    };
+  }
+
+  // ── cone / hat / spike / pyramid ───────────────────────────────────────────
+  if (/cone|hat|spike|pyramid|obelisk/.test(t)) {
+    return {
+      label: t.slice(0, 32),
+      metalness, roughness,
+      ops: [
+        { prim: 'cone',   mode: 'union', color: baseColor,      pos: [0, sc(-0.3), 0], r: sc(0.5), h: sc(tall ? 1.2 : 0.8) },
+        { prim: 'sphere', mode: 'union', color: baseColor+'88', pos: [0, sc(-0.3), 0], r: sc(0.08) },
+      ],
+    };
+  }
+
+  // ── box / cube / crate / block ────────────────────────────────────────────
+  if (/cube|box|crate|block|brick|chest|safe/.test(t)) {
+    const sx = wide ? 0.7 : 0.38, sy = tall ? 0.85 : 0.38, sz = 0.38;
+    return {
+      label: t.slice(0, 32),
+      metalness, roughness,
+      ops: [
+        { prim: 'box',    mode: 'union',    color: baseColor,      pos: [0, 0, 0], size: sv3(sx, sy, sz) },
+        { prim: 'box',    mode: 'subtract', color: '#101018',      pos: [0, sc(sy*0.3), sc(sz)], size: sv3(sx*0.6, sy*0.25, sz*0.15) },
+        { prim: 'sphere', mode: 'union',    color: baseColor+'aa', pos: [0, sc(sy*0.1), sc(sz)],  r: sc(0.06) },
+      ],
+    };
+  }
+
+  // ── sphere / ball / orb / planet ──────────────────────────────────────────
+  // Use word boundaries so "ball" doesn't match inside "balloon", "basketball" etc.
+  if (/\bsphere\b|\bball\b|\borb\b|\bglobe\b|\bplanet\b|\bbubble\b|\bbead\b/.test(t)) {
+    const r = scale * (wide ? 0.65 : tall ? 0.4 : 0.52);
+    return {
+      label: t.slice(0, 32),
+      metalness, roughness,
+      ops: [
+        { prim: 'sphere', mode: 'union', color: baseColor,      pos: [0, 0, 0], r },
+        { prim: 'sphere', mode: 'union', color: baseColor+'99', pos: [sc(0.15), sc(0.2), sc(r*0.85)], r: sc(0.12) },
+      ],
+    };
+  }
+
+  // ── humanoid / character / person / figure ────────────────────────────────
+  if (/person|human|figure|character|body|man|woman|robot/.test(t)) {
+    return {
+      label: t.slice(0, 32),
+      metalness, roughness,
+      ops: [
+        { prim: 'capsule', mode: 'union',  color: baseColor,       pos: [0, sc(-0.1), 0], size: [0, sc(0.75), 0], r: sc(0.28) },
+        { prim: 'sphere',  mode: 'smooth', blend: 0.1, color: baseColor, pos: [0, sc(0.72), 0], r: sc(0.24) },
+        { prim: 'capsule', mode: 'union',  color: baseColor+'cc',  pos: [sc(-0.5), sc(0.25), 0], size: [sc(0.5), sc(-0.55), 0], r: sc(0.09) },
+        { prim: 'capsule', mode: 'union',  color: baseColor+'cc',  pos: [sc(0.5),  sc(0.25), 0], size: [sc(-0.5), sc(-0.55), 0], r: sc(0.09) },
+      ],
+    };
+  }
+
+  // ── flower / plant / stem ─────────────────────────────────────────────────
+  if (/flower|petal|bloom|blossom|plant|stem/.test(t)) {
+    const petalColor = baseColor === '#7b8cfa' ? '#e85a9b' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      roughness: Math.max(roughness, 0.55),
+      parts: [
+        { name: 'petal', ops: [
+          { prim: 'ellipsoid', mode: 'union', color: petalColor, pos: [0,0,0], size: [sc(0.32), sc(0.05), sc(0.16)] },
+        ]},
+      ],
+      symmetries: [
+        { kind: 'radial', of: 'petal', count: 6, radius: sc(0.18), axis: 'y', spin: true },
+      ],
+      ops: [
+        { prim: 'capsule', mode: 'union', color: '#3a8a3a', pos: [0, sc(-0.75), 0], size: [0, sc(0.9), 0], r: sc(0.05) },
+        { prim: 'sphere',  mode: 'union', color: '#dcb35c', pos: [0, sc(0.06), 0], r: sc(0.13) },
+      ],
+    };
+  }
+
+  // ── mushroom / toadstool ───────────────────────────────────────────────────
+  if (/mushroom|toadstool|fungus/.test(t)) {
+    const capColor = baseColor === '#7b8cfa' ? '#d5687f' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      roughness: Math.max(roughness, 0.6),
+      ops: [
+        { prim: 'capsule',   mode: 'union',  color: '#e6dfc9',   pos: [0, sc(-0.82), 0], size: [0, sc(0.75), 0], r: sc(0.32) },
+        { prim: 'ellipsoid', mode: 'smooth', blend: 0.1, color: capColor, pos: [0, sc(0.22), 0], size: [sc(0.82), sc(0.48), sc(0.82)] },
+        { prim: 'sphere',    mode: 'union',  color: '#e8ecf4',   pos: [sc(0.38), sc(0.42), sc(0.52)], r: sc(0.09) },
+        { prim: 'sphere',    mode: 'union',  color: '#e8ecf4',   pos: [sc(-0.48), sc(0.5),  sc(0.28)], r: sc(0.12) },
+      ],
+    };
+  }
+
+  // ── rocket / spaceship / missile ──────────────────────────────────────────
+  if (/rocket|spaceship|missile|spacecraft|shuttle/.test(t)) {
+    const bodyColor = baseColor === '#7b8cfa' ? '#c6ccda' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      metalness: Math.max(metalness, 0.5), roughness: Math.min(roughness, 0.4),
+      ops: [
+        { prim: 'capsule',   mode: 'union',  color: bodyColor,    pos: [0, sc(-0.65), 0], size: [0, sc(1.2), 0], r: sc(0.28) },
+        { prim: 'ellipsoid', mode: 'smooth', blend: 0.08, color: '#d5687f', pos: [0, sc(0.72), 0], size: [sc(0.22), sc(0.38), sc(0.22)] },
+        { prim: 'box',       mode: 'union',  color: '#d5687f',    pos: [0, sc(-0.7), 0], size: [sc(0.6), sc(0.26), sc(0.04)] },
+        { prim: 'box',       mode: 'union',  color: '#d5687f',    pos: [0, sc(-0.7), 0], rot: [0,90,0], size: [sc(0.6), sc(0.26), sc(0.04)] },
+      ],
+    };
+  }
+
+  // ── snowman / frosty ──────────────────────────────────────────────────────
+  if (/snowman|snowwoman|frosty/.test(t)) {
+    return {
+      label: t.slice(0, 32),
+      roughness: 0.7,
+      ops: [
+        { prim: 'sphere', mode: 'union',  color: '#dde8f0', pos: [0, sc(-0.48), 0], r: sc(0.42) },
+        { prim: 'sphere', mode: 'smooth', blend: 0.08, color: '#e8f0f8', pos: [0, sc(0.22), 0], r: sc(0.32) },
+        { prim: 'sphere', mode: 'smooth', blend: 0.06, color: '#e8f0f8', pos: [0, sc(0.74), 0], r: sc(0.23) },
+        { prim: 'sphere', mode: 'union',  color: '#e86c2e', pos: [0, sc(0.72), sc(0.22)], r: sc(0.055) },
+      ],
+    };
+  }
+
+  // ── tree / bush / organic blob ────────────────────────────────────────────
+  if (/tree|bush|shrub|oak|pine|fir|cactus/.test(t)) {
+    const foliageColor = baseColor === '#7b8cfa' ? '#2e8a45' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      roughness: 0.75,
+      warp: { amp: 0.06, freq: 6, octaves: 3 },
+      ops: [
+        { prim: 'capsule', mode: 'union',  color: '#6b3f1a', pos: [0, sc(-0.82), 0], size: [0, sc(0.9), 0], r: sc(0.09) },
+        { prim: 'sphere',  mode: 'union',  color: foliageColor, pos: [0, sc(0.35), 0], r: sc(0.52) },
+        { prim: 'sphere',  mode: 'smooth', blend: 0.1, color: foliageColor, pos: [sc(0.3), sc(0.5), sc(0.2)], r: sc(0.3) },
+        { prim: 'sphere',  mode: 'smooth', blend: 0.1, color: foliageColor, pos: [sc(-0.28), sc(0.52), sc(-0.18)], r: sc(0.28) },
+      ],
+    };
+  }
+
+  // ── pickup truck / F-150 / van / SUV ─────────────────────────────────────
+  if (/truck|pickup|f.?150|f.?250|f.?350|ram|silverado|tacoma|van|suv|4x4/.test(t)) {
+    const body = baseColor === '#7b8cfa' ? '#2a4a7c' : baseColor; // default deep blue
+    const wheel = '#1a1a22';
+    return {
+      label: t.slice(0, 32),
+      metalness: Math.max(metalness, 0.55), roughness: 0.4,
+      ops: [
+        // bed (low, rear)
+        { prim: 'box', mode: 'union', color: body,    pos: [sc(-0.3), sc(-0.35), 0],    size: [sc(0.42), sc(0.18), sc(0.45)] },
+        // cab (taller, forward)
+        { prim: 'box', mode: 'union', color: body,    pos: [sc(0.28), sc(-0.15), 0],    size: [sc(0.36), sc(0.35), sc(0.42)] },
+        // windshield angle (carved from front of cab)
+        { prim: 'box', mode: 'subtract', color: '#88aacc', pos: [sc(0.58), sc(0.2), 0], rot: [0, 0, 28], size: [sc(0.12), sc(0.3), sc(0.44)] },
+        // chassis/underframe
+        { prim: 'box', mode: 'union', color: '#252530', pos: [0, sc(-0.54), 0],          size: [sc(0.75), sc(0.05), sc(0.38)] },
+        // front bumper
+        { prim: 'box', mode: 'union', color: '#3a3a48', pos: [sc(0.65), sc(-0.4), 0],   size: [sc(0.06), sc(0.1), sc(0.42)] },
+        // rear bumper
+        { prim: 'box', mode: 'union', color: '#3a3a48', pos: [sc(-0.73), sc(-0.4), 0],  size: [sc(0.05), sc(0.08), sc(0.42)] },
+        // wheel front-left
+        { prim: 'torus', mode: 'union', color: wheel, pos: [sc(0.45), sc(-0.55), sc(0.5)],  R: sc(0.2), r: sc(0.1) },
+        // wheel front-right
+        { prim: 'torus', mode: 'union', color: wheel, pos: [sc(0.45), sc(-0.55), sc(-0.5)], R: sc(0.2), r: sc(0.1) },
+        // wheel rear-left
+        { prim: 'torus', mode: 'union', color: wheel, pos: [sc(-0.42), sc(-0.55), sc(0.5)],  R: sc(0.2), r: sc(0.1) },
+        // wheel rear-right
+        { prim: 'torus', mode: 'union', color: wheel, pos: [sc(-0.42), sc(-0.55), sc(-0.5)], R: sc(0.2), r: sc(0.1) },
+      ],
+    };
+  }
+
+  // ── car / sedan / sports car / coupe ──────────────────────────────────────
+  if (/\bcar\b|sedan|coupe|sports.car|ferrari|lamborghini|mustang|corvette|vehicle|automobile/.test(t)) {
+    const body = baseColor === '#7b8cfa' ? '#c03030' : baseColor; // default red
+    const wheel = '#1a1a22';
+    return {
+      label: t.slice(0, 32),
+      metalness: Math.max(metalness, 0.6), roughness: 0.35,
+      ops: [
+        // main body hull
+        { prim: 'box', mode: 'union', color: body,    pos: [0, sc(-0.32), 0],           size: [sc(0.75), sc(0.16), sc(0.4)] },
+        // cabin roof (ellipsoid for curve)
+        { prim: 'ellipsoid', mode: 'smooth', blend: 0.1, color: body, pos: [sc(0.05), sc(0.05), 0], size: [sc(0.45), sc(0.22), sc(0.35)] },
+        // windshield glass (subtract front slope)
+        { prim: 'box', mode: 'subtract', color: '#88aacc', pos: [sc(0.45), sc(0.1), 0], rot: [0,0,32], size: [sc(0.1), sc(0.25), sc(0.36)] },
+        // rear glass slope
+        { prim: 'box', mode: 'subtract', color: '#88aacc', pos: [sc(-0.38), sc(0.1), 0], rot: [0,0,-28], size: [sc(0.1), sc(0.22), sc(0.36)] },
+        // wheel fl
+        { prim: 'torus', mode: 'union', color: wheel, pos: [sc(0.48), sc(-0.45), sc(0.44)],  R: sc(0.18), r: sc(0.09) },
+        // wheel fr
+        { prim: 'torus', mode: 'union', color: wheel, pos: [sc(0.48), sc(-0.45), sc(-0.44)], R: sc(0.18), r: sc(0.09) },
+        // wheel rl
+        { prim: 'torus', mode: 'union', color: wheel, pos: [sc(-0.48), sc(-0.45), sc(0.44)],  R: sc(0.18), r: sc(0.09) },
+        // wheel rr
+        { prim: 'torus', mode: 'union', color: wheel, pos: [sc(-0.48), sc(-0.45), sc(-0.44)], R: sc(0.18), r: sc(0.09) },
+      ],
+    };
+  }
+
+  // ── house / building / cabin / cottage ────────────────────────────────────
+  if (/house|home|cabin|cottage|building|hut|bungalow|mansion|shed/.test(t)) {
+    const wall = baseColor === '#7b8cfa' ? '#d4b483' : baseColor;
+    const roof = '#8b3a2a';
+    return {
+      label: t.slice(0, 32),
+      roughness: Math.max(roughness, 0.65),
+      ops: [
+        // walls
+        { prim: 'box',  mode: 'union', color: wall,    pos: [0, sc(-0.22), 0],         size: [sc(0.65), sc(0.42), sc(0.52)] },
+        // roof (cone approximated with tilted box slabs)
+        { prim: 'box',  mode: 'union', color: roof,    pos: [0, sc(0.42), 0],           rot: [0,0,42],   size: [sc(0.62), sc(0.08), sc(0.56)] },
+        { prim: 'box',  mode: 'union', color: roof,    pos: [0, sc(0.42), 0],           rot: [0,0,-42],  size: [sc(0.62), sc(0.08), sc(0.56)] },
+        // chimney
+        { prim: 'box',  mode: 'union', color: '#6b3a2a', pos: [sc(0.3), sc(0.6), sc(0.2)], size: [sc(0.08), sc(0.22), sc(0.08)] },
+        // door (subtract)
+        { prim: 'box',  mode: 'subtract', color: '#1a1a20', pos: [sc(0.05), sc(-0.38), sc(0.52)], size: [sc(0.1), sc(0.22), sc(0.06)] },
+        // window left
+        { prim: 'box',  mode: 'subtract', color: '#88aacc', pos: [sc(-0.35), sc(-0.12), sc(0.52)], size: [sc(0.12), sc(0.1), sc(0.06)] },
+        // window right
+        { prim: 'box',  mode: 'subtract', color: '#88aacc', pos: [sc(0.38), sc(-0.12), sc(0.52)],  size: [sc(0.12), sc(0.1), sc(0.06)] },
+      ],
+    };
+  }
+
+  // ── chess pawn ────────────────────────────────────────────────────────────
+  if (/pawn|chess|rook|bishop|knight|queen|king/.test(t)) {
+    const pc = baseColor === '#7b8cfa' ? '#d4c9a8' : baseColor;
+    const isPieceType = /rook/.test(t) ? 'rook' : /bishop/.test(t) ? 'bishop' : /queen/.test(t) ? 'queen' : /king/.test(t) ? 'king' : 'pawn';
+    if (isPieceType === 'rook') {
+      return {
+        label: t.slice(0, 32), metalness, roughness,
+        ops: [
+          { prim: 'capsule', mode: 'union', color: pc, pos: [0, sc(-0.65), 0], size: [0, sc(1.0), 0], r: sc(0.22) },
+          { prim: 'torus',   mode: 'union', color: pc, pos: [0, sc(0.35), 0], R: sc(0.22), r: sc(0.06) },
+          { prim: 'box',     mode: 'union', color: pc, pos: [0, sc(0.5), 0], size: [sc(0.24), sc(0.12), sc(0.24)] },
+          { prim: 'box', mode: 'subtract', color: '#101018', pos: [sc(0.14), sc(0.58), sc(0.14)], size: [sc(0.06), sc(0.1), sc(0.06)] },
+          { prim: 'box', mode: 'subtract', color: '#101018', pos: [sc(-0.14), sc(0.58), sc(-0.14)], size: [sc(0.06), sc(0.1), sc(0.06)] },
+        ],
+      };
+    }
+    // default: pawn
+    return {
+      label: t.slice(0, 32), metalness, roughness,
+      ops: [
+        // wide base
+        { prim: 'torus',   mode: 'union', color: pc, pos: [0, sc(-0.6), 0], R: sc(0.28), r: sc(0.1) },
+        { prim: 'capsule', mode: 'smooth', blend: 0.08, color: pc, pos: [0, sc(-0.55), 0], size: [0, sc(0.55), 0], r: sc(0.16) },
+        // neck
+        { prim: 'capsule', mode: 'union', color: pc, pos: [0, sc(0.02), 0], size: [0, sc(0.22), 0], r: sc(0.09) },
+        // collar ring
+        { prim: 'torus', mode: 'union', color: pc, pos: [0, sc(0.26), 0], R: sc(0.14), r: sc(0.05) },
+        // head sphere
+        { prim: 'sphere', mode: 'smooth', blend: 0.06, color: pc, pos: [0, sc(0.52), 0], r: sc(0.2) },
+      ],
+    };
+  }
+
+  // ── crown / tiara ─────────────────────────────────────────────────────────
+  if (/crown|tiara|diadem/.test(t)) {
+    const cc = baseColor === '#7b8cfa' ? '#c9a940' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      metalness: Math.max(metalness, 0.8), roughness: Math.min(roughness, 0.25),
+      parts: [
+        { name: 'spike', ops: [
+          { prim: 'cone', mode: 'union', color: cc, pos: [0, sc(0.1), 0], r: sc(0.06), h: sc(0.42) },
+        ]},
+      ],
+      symmetries: [
+        { kind: 'radial', of: 'spike', count: 7, radius: sc(0.42), axis: 'y', spin: true },
+      ],
+      ops: [
+        { prim: 'torus', mode: 'union', color: cc,      pos: [0, 0, 0], R: sc(0.44), r: sc(0.08) },
+        { prim: 'torus', mode: 'union', color: cc+'88', pos: [0, sc(-0.12), 0], R: sc(0.42), r: sc(0.05) },
+      ],
+    };
+  }
+
+  // ── anchor / naval ────────────────────────────────────────────────────────
+  if (/anchor|naval|nautical|ship anchor/.test(t)) {
+    const ac = baseColor === '#7b8cfa' ? '#505870' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      metalness: Math.max(metalness, 0.7), roughness: 0.4,
+      ops: [
+        // vertical shank
+        { prim: 'capsule', mode: 'union', color: ac, pos: [0, sc(-0.1), 0], size: [0, sc(1.1), 0], r: sc(0.06) },
+        // top ring
+        { prim: 'torus',   mode: 'union', color: ac, pos: [0, sc(0.62), 0], R: sc(0.2), r: sc(0.05) },
+        // crossbar (horizontal stock)
+        { prim: 'capsule', mode: 'union', color: ac, pos: [0, sc(0.38), 0], size: [sc(0.72), 0, 0], r: sc(0.05) },
+        // left arm
+        { prim: 'capsule', mode: 'union', color: ac, pos: [sc(-0.1), sc(-0.7), 0], size: [sc(-0.3), sc(-0.28), 0], r: sc(0.05) },
+        // right arm
+        { prim: 'capsule', mode: 'union', color: ac, pos: [sc(0.1),  sc(-0.7), 0], size: [sc(0.3),  sc(-0.28), 0], r: sc(0.05) },
+        // left fluke
+        { prim: 'sphere',  mode: 'union', color: ac, pos: [sc(-0.38), sc(-0.88), 0], r: sc(0.1) },
+        // right fluke
+        { prim: 'sphere',  mode: 'union', color: ac, pos: [sc(0.38),  sc(-0.88), 0], r: sc(0.1) },
+      ],
+    };
+  }
+
+  // ── hot air balloon ───────────────────────────────────────────────────────
+  if (/balloon|hot.air|airship|blimp|zeppelin/.test(t)) {
+    const envColor = baseColor === '#7b8cfa' ? '#e85040' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      roughness: 0.7,
+      ops: [
+        // envelope (large sphere, slightly oblate)
+        { prim: 'ellipsoid', mode: 'union', color: envColor,     pos: [0, sc(0.28), 0], size: [sc(0.68), sc(0.82), sc(0.68)] },
+        // vertical stripe detail (intersecting ellipsoids)
+        { prim: 'ellipsoid', mode: 'union', color: '#e8c030',    pos: [sc(0.55), sc(0.28), 0], size: [sc(0.14), sc(0.8), sc(0.14)] },
+        { prim: 'ellipsoid', mode: 'union', color: '#e8c030',    pos: [sc(-0.55), sc(0.28), 0], size: [sc(0.14), sc(0.8), sc(0.14)] },
+        // rope bundle (thin capsule below)
+        { prim: 'capsule',   mode: 'union', color: '#8a7a5a',    pos: [0, sc(-0.56), 0], size: [0, sc(0.26), 0], r: sc(0.04) },
+        // basket (small box)
+        { prim: 'box',       mode: 'union', color: '#a08040',    pos: [0, sc(-0.88), 0], size: [sc(0.22), sc(0.12), sc(0.22)] },
+        // burner glow
+        { prim: 'sphere',    mode: 'union', color: '#ff8820',    pos: [0, sc(-0.7), 0], r: sc(0.06) },
+      ],
+    };
+  }
+
+  // ── hourglass / egg timer ─────────────────────────────────────────────────
+  if (/hourglass|egg.timer|sand.timer|sandglass/.test(t)) {
+    const hc = baseColor === '#7b8cfa' ? '#c8a060' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      metalness: Math.max(metalness, 0.5), roughness: 0.35,
+      ops: [
+        // top bulb
+        { prim: 'sphere',   mode: 'union',    color: '#d0d8e8',    pos: [0, sc(0.46), 0], r: sc(0.38) },
+        // bottom bulb
+        { prim: 'sphere',   mode: 'union',    color: '#d0d8e8',    pos: [0, sc(-0.46), 0], r: sc(0.38) },
+        // carved pinch (subtract cylinder in middle)
+        { prim: 'capsule',  mode: 'subtract', color: '#000',       pos: [0, 0, 0], size: [0, sc(0.2), 0], r: sc(0.28) },
+        // frame top ring
+        { prim: 'torus',    mode: 'union',    color: hc,           pos: [0, sc(0.72), 0], R: sc(0.32), r: sc(0.05) },
+        // frame bottom ring
+        { prim: 'torus',    mode: 'union',    color: hc,           pos: [0, sc(-0.72), 0], R: sc(0.32), r: sc(0.05) },
+        // left post
+        { prim: 'capsule',  mode: 'union',    color: hc,           pos: [sc(0.32), 0, 0], size: [0, sc(0.74), 0], r: sc(0.04) },
+        // right post
+        { prim: 'capsule',  mode: 'union',    color: hc,           pos: [sc(-0.32), 0, 0], size: [0, sc(0.74), 0], r: sc(0.04) },
+      ],
+    };
+  }
+
+  // ── chair / stool / armchair / throne ─────────────────────────────────────
+  if (/\bchair\b|stool|throne|armchair|bench|sofa|couch/.test(t)) {
+    const wood = baseColor === '#7b8cfa' ? '#8a5c30' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      roughness: Math.max(roughness, 0.65),
+      ops: [
+        // seat
+        { prim: 'box', mode: 'union', color: wood,      pos: [0, sc(-0.1), 0],         size: [sc(0.42), sc(0.06), sc(0.4)] },
+        // back rest
+        { prim: 'box', mode: 'union', color: wood,      pos: [sc(-0.38), sc(0.22), 0], size: [sc(0.04), sc(0.38), sc(0.38)] },
+        // leg fl
+        { prim: 'capsule', mode: 'union', color: wood,  pos: [sc(0.32), sc(-0.6), sc(0.3)],  size: [0, sc(0.5), 0], r: sc(0.04) },
+        // leg fr
+        { prim: 'capsule', mode: 'union', color: wood,  pos: [sc(0.32), sc(-0.6), sc(-0.3)], size: [0, sc(0.5), 0], r: sc(0.04) },
+        // leg rl
+        { prim: 'capsule', mode: 'union', color: wood,  pos: [sc(-0.32), sc(-0.6), sc(0.3)],  size: [0, sc(0.5), 0], r: sc(0.04) },
+        // leg rr
+        { prim: 'capsule', mode: 'union', color: wood,  pos: [sc(-0.32), sc(-0.6), sc(-0.3)], size: [0, sc(0.5), 0], r: sc(0.04) },
+      ],
+    };
+  }
+
+  // ── sword / blade / dagger / katana / knife ───────────────────────────────
+  if (/sword|blade|dagger|katana|sabre|saber|\bknife\b|rapier/.test(t)) {
+    const metal = baseColor === '#7b8cfa' ? '#c8d0d8' : baseColor;
+    return {
+      label: t.slice(0, 32),
+      metalness: Math.max(metalness, 0.85), roughness: Math.min(roughness, 0.2),
+      ops: [
+        // blade (flat box, tapers — approximated)
+        { prim: 'box',     mode: 'union', color: metal,      pos: [0, sc(0.22), 0],        size: [sc(0.04), sc(0.78), sc(0.04)] },
+        { prim: 'cone',    mode: 'union', color: metal,      pos: [0, sc(1.0), 0],         r: sc(0.04), h: sc(0.2) },
+        // crossguard
+        { prim: 'box',     mode: 'union', color: '#a87820',  pos: [0, sc(-0.18), 0],       size: [sc(0.04), sc(0.06), sc(0.38)] },
+        { prim: 'sphere',  mode: 'union', color: '#a87820',  pos: [0, sc(-0.18), sc(0.38)], r: sc(0.06) },
+        { prim: 'sphere',  mode: 'union', color: '#a87820',  pos: [0, sc(-0.18), sc(-0.38)], r: sc(0.06) },
+        // grip / handle
+        { prim: 'capsule', mode: 'union', color: '#4a2e18',  pos: [0, sc(-0.5), 0],        size: [0, sc(0.36), 0], r: sc(0.07) },
+        // pommel
+        { prim: 'sphere',  mode: 'union', color: '#a87820',  pos: [0, sc(-0.75), 0],       r: sc(0.1) },
+      ],
+    };
+  }
+
+  // ── generic fallback: a simple stacked form using the detected colour ──────
+  // Only returned when at least some non-trivial text was typed.
+  if (t.length >= 4) {
+    return {
+      label: t.slice(0, 32),
+      metalness, roughness,
+      ops: [
+        { prim: 'sphere',  mode: 'union',  color: baseColor,      pos: [0, sc(-0.08), 0], r: sc(0.42) },
+        { prim: 'ellipsoid', mode: 'smooth', blend: 0.1, color: baseColor, pos: [0, sc(0.5), 0], size: [sc(tall ? 0.18 : 0.3), sc(tall ? 0.55 : 0.28), sc(0.28)] },
+      ],
+    };
+  }
+
+  return null;
+}

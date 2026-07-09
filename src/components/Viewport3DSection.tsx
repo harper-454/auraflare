@@ -3,27 +3,47 @@ import { Canvas, useFrame } from '@react-three/fiber';
 import { OrbitControls, Grid, ContactShadows, Environment } from '@react-three/drei';
 import { useRef, useState, useEffect, useCallback, useMemo } from 'react';
 import { useAutoSave } from '../hooks/useAutoSave';
-import { Play, Pause, Download, Wand2, RefreshCw, AlertTriangle, Sparkles, Box, Cpu, Zap, Cog } from 'lucide-react';
+import { Play, Pause, Download, Wand2, RefreshCw, AlertTriangle, Sparkles, Cpu, Cog, Paintbrush, ImagePlus } from 'lucide-react';
 import * as THREE from 'three';
 
 // The real text-to-3D pipeline (already shipped in src/lib, but only the
 // buried IDE > 3D tab exposed it). This view routes the same engine to the
 // visible "3D Viewport" surface so the prompt box actually generates a model.
-import { composeWithAI, refineProgramWithAI, PRESET_PROGRAMS, type ShapeProgram } from '../lib/sdf-compiler';
-import { compileProgramAuto } from '../lib/sdf-gpu';
+import { composeWithAI, refineProgramWithAI, buildPreviewProgram, type ShapeProgram } from '../lib/sdf-compiler';
+import { compileProgramAuto, warmupGPU } from '../lib/sdf-gpu';
+import { applyTriplanarToGroup, loadTexture } from '../lib/sdf-material';
 import { parsePromptLocally, generateModel, exportGLB } from '../lib/meshforge';
+// 3D-2: live sphere-tracing preview — shows the SDF as a raymarched image
+// while the user types, before polygonisation runs.
+import { SDFRaytracer } from './SDFRaytracer';
 
-type Mode = 'ai' | 'humanoid' | 'animal' | 'mechanical';
 type Stats = {
   triangles: number;
   opCount: number | null;
-  backend: 'gpu' | 'cpu' | 'preset';
+  backend: 'gpu' | 'cpu';
   resolution: number;
   fieldMs: number;
   bytes: number;
   loadMs: number;
-  source: 'ai' | 'preset' | 'local';
+  source: 'ai' | 'local' | 'photo';
 };
+
+/**
+ * Downscale a photo to a JPEG data URL. One size serves both consumers: the
+ * vision-caption endpoint (which resizes further anyway) and the triplanar
+ * albedo texture (1024px is plenty for a projected material).
+ */
+async function photoToDataUrl(file: File, maxDim = 1024): Promise<string> {
+  const bmp = await createImageBitmap(file);
+  const scale = Math.min(1, maxDim / Math.max(bmp.width, bmp.height));
+  const w = Math.max(1, Math.round(bmp.width * scale));
+  const h = Math.max(1, Math.round(bmp.height * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = w; canvas.height = h;
+  canvas.getContext('2d')!.drawImage(bmp, 0, 0, w, h);
+  bmp.close();
+  return canvas.toDataURL('image/jpeg', 0.85);
+}
 
 const PROMPT_IDEAS = [
   'a snowman with a carrot nose',
@@ -37,45 +57,6 @@ const PROMPT_IDEAS = [
   'a chess pawn',
   'a colorful hot air balloon',
 ];
-
-// ——— Preset rigs (kept from the original view; no longer the only path) ———
-function PresetRig({ kind, spin }: { kind: 'humanoid' | 'animal' | 'mechanical'; spin: boolean }) {
-  const ref = useRef<THREE.Group>(null);
-  useFrame((_, delta) => {
-    if (spin && ref.current) {
-      ref.current.rotation.y += delta * 0.4;
-      ref.current.position.y = Math.sin(performance.now() / 600) * 0.1;
-    }
-  });
-  return (
-    <group ref={ref} position={[0, 0.5, 0]}>
-      {kind === 'humanoid' && (
-        <>
-          <mesh castShadow position={[0, 0, 0]}><boxGeometry args={[1, 1.5, 0.5]} /><meshStandardMaterial color="#6366f1" /></mesh>
-          <mesh castShadow position={[0, 1.1, 0]}><sphereGeometry args={[0.4, 32, 32]} /><meshStandardMaterial color="#818cf8" /></mesh>
-          <mesh castShadow position={[-0.8, 0.2, 0]}><boxGeometry args={[0.3, 1, 0.3]} /><meshStandardMaterial color="#a5b4fc" /></mesh>
-          <mesh castShadow position={[0.8, 0.2, 0]}><boxGeometry args={[0.3, 1, 0.3]} /><meshStandardMaterial color="#a5b4fc" /></mesh>
-        </>
-      )}
-      {kind === 'animal' && (
-        <>
-          <mesh castShadow position={[0, 0, 0]}><boxGeometry args={[0.8, 0.6, 1.5]} /><meshStandardMaterial color="#10b981" /></mesh>
-          <mesh castShadow position={[0, 0.5, 0.85]}><boxGeometry args={[0.4, 0.4, 0.6]} /><meshStandardMaterial color="#34d399" /></mesh>
-          <mesh castShadow position={[0.7, -0.55, 0.55]}><boxGeometry args={[0.2, 0.8, 0.2]} /><meshStandardMaterial color="#6ee7b7" /></mesh>
-          <mesh castShadow position={[-0.7, -0.55, 0.55]}><boxGeometry args={[0.2, 0.8, 0.2]} /><meshStandardMaterial color="#6ee7b7" /></mesh>
-        </>
-      )}
-      {kind === 'mechanical' && (
-        <>
-          <mesh castShadow position={[0, 0, 0]}><boxGeometry args={[1.2, 0.8, 1.2]} /><meshStandardMaterial color="#f59e0b" /></mesh>
-          <mesh castShadow position={[0, 0.6, 0]}><sphereGeometry args={[0.3, 16, 16]} /><meshStandardMaterial color="#ef4444" /></mesh>
-          <mesh ref={undefined} castShadow position={[-0.7, 0, 0]} rotation={[Math.PI / 2, 0, 0]}><cylinderGeometry args={[0.4, 0.4, 0.2, 12]} /><meshStandardMaterial color="#fbbf24" /></mesh>
-          <mesh castShadow position={[0.7, 0, 0]} rotation={[Math.PI / 2, 0, 0]}><cylinderGeometry args={[0.4, 0.4, 0.2, 12]} /><meshStandardMaterial color="#fbbf24" /></mesh>
-        </>
-      )}
-    </group>
-  );
-}
 
 // Renders an arbitrary generated THREE.Group inside the canvas, with auto-rotation.
 function GeneratedMesh({ group, spin }: { group: THREE.Group; spin: boolean }) {
@@ -93,7 +74,6 @@ function GeneratedMesh({ group, spin }: { group: THREE.Group; spin: boolean }) {
 }
 
 export function Viewport3DSection() {
-  const [mode, setMode] = useAutoSave<Mode>('viewport-mode', 'ai');
   const [ambientIntensity, setAmbientIntensity] = useAutoSave('viewport-ambient', 0.5);
   const [spotIntensity, setSpotIntensity] = useAutoSave('viewport-spot', 1.5);
   const [spin, setSpin] = useState(true);
@@ -111,11 +91,33 @@ export function Viewport3DSection() {
   const [stats, setStats] = useState<Stats | null>(null);
   const loadStart = useRef(0);
 
+  // Texturing (triplanar projection — SDF meshes have no UVs) + photo→3D.
+  const [textureText, setTextureText] = useState('');
+  const [isTexturing, setIsTexturing] = useState(false);
+  const [textureInfo, setTextureInfo] = useState<string | null>(null);
+  const [isPhotoLoading, setIsPhotoLoading] = useState(false);
+  const photoInputRef = useRef<HTMLInputElement>(null);
+
+  // 3D-2: live preview — build a fresh ShapeProgram from the prompt text using
+  // keyword heuristics (no preset lookup), then raymarch it while the AI compose
+  // call runs.  buildPreviewProgram constructs every ShapeProgram from scratch.
+  const [previewProgram, setPreviewProgram] = useState<ShapeProgram | null>(null);
+  useEffect(() => {
+    const tid = setTimeout(() => {
+      setPreviewProgram(prompt.trim().length >= 4 ? buildPreviewProgram(prompt) : null);
+    }, 350);
+    return () => clearTimeout(tid);
+  }, [prompt]);
+
   // Auto-rotate toggle was the old "play/pause". Keep the affordance.
   const [isPlaying, setIsPlaying] = useState(true);
   useEffect(() => { setSpin(isPlaying); }, [isPlaying]);
 
-  const runForge = useCallback(async (input?: string) => {
+  // Compile the GPU kernel up front (one-time ~seconds cost) so it overlaps with
+  // the user reading the UI / typing — the first "Generate" then skips the wait.
+  useEffect(() => { warmupGPU(); }, []);
+
+  const runForge = useCallback(async (input?: string, photoDataUrl?: string) => {
     const text = (input ?? prompt).trim();
     if (!text) return;
     setIsGenerating(true);
@@ -126,27 +128,30 @@ export function Viewport3DSection() {
       let group: THREE.Group;
       let triangles: number;
       let opCount: number | null = null;
-      let backend: Stats['backend'] = 'preset';
+      let backend: Stats['backend'] = 'cpu';
       let resolution = 0;
       let fieldMs = 0;
       let source: Stats['source'] = 'ai';
+      let programForMat: ShapeProgram | null = null;
 
-      // Deterministic-first (AGENTS.md §1): try the LLM-composed SDF program,
-      // then fall back to preset, then to the fully-offline parametric generator.
+      // AI compose first; offline, buildPreviewProgram's heuristics compose a
+      // fresh program (same engine, no canned models); the parametric
+      // single-family generator is the absolute last resort.
       const composed = await composeWithAI(text);
-      if (composed) {
-        const compiled = await compileProgramAuto(composed.program);
+      const program = composed?.program ?? buildPreviewProgram(text);
+      if (program) {
+        const compiled = await compileProgramAuto(program);
         group = compiled.group;
         triangles = compiled.triangles;
         opCount = compiled.opCount;
         backend = compiled.backend;
         resolution = compiled.resolution;
         fieldMs = compiled.fieldMs;
-        source = composed.source;
-        setLastProgram(composed.program);
-        setLabel(composed.program.label);
+        source = composed ? 'ai' : 'local';
+        programForMat = program;
+        setLastProgram(program);
+        setLabel(program.label);
       } else {
-        // Fully offline fallback: keyword → parametric single-family mesh.
         const spec = parsePromptLocally(text);
         const gen = generateModel(text, spec);
         group = gen.group;
@@ -156,8 +161,23 @@ export function Viewport3DSection() {
         setLabel(spec.label || text.slice(0, 24));
       }
 
+      // .glb export carries geometry + vertex colors; the triplanar texture is
+      // a shader projection and has no glTF representation (yet — xatlas bake
+      // is the known follow-up), so export before texturing.
       const blob = await exportGLB(group);
       setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return URL.createObjectURL(blob); });
+
+      if (photoDataUrl) {
+        // Photo→3D: the uploaded photo doubles as the triplanar albedo, so the
+        // model wears the exact real-world surface it was generated from.
+        const tex = await loadTexture(photoDataUrl);
+        applyTriplanarToGroup(group, tex, { metalness: programForMat?.metalness, roughness: programForMat?.roughness });
+        source = 'photo';
+        setTextureInfo('photo albedo');
+      } else {
+        setTextureInfo(null);
+      }
+
       setGeneratedGroup(group);
       setStats({
         triangles, opCount, backend, resolution, fieldMs,
@@ -185,6 +205,7 @@ export function Viewport3DSection() {
       setGeneratedGroup(compiled.group);
       setLastProgram(updated);
       setLabel(updated.label);
+      setTextureInfo(null); // recompile rebuilds plain materials — texture is gone
       setStats({
         triangles: compiled.triangles, opCount: compiled.opCount, backend: compiled.backend,
         resolution: compiled.resolution, fieldMs: compiled.fieldMs,
@@ -197,6 +218,61 @@ export function Viewport3DSection() {
       setIsRefining(false);
     }
   }, [refineText, lastProgram]);
+
+  // Generate a seamless material with SDXL-Lightning and project it onto the
+  // current mesh (triplanar — no UVs needed). Blank input derives the material
+  // from the model's own label.
+  const applyTexture = useCallback(async () => {
+    if (!generatedGroup) return;
+    const matPrompt = textureText.trim() || `${label || prompt} surface material`;
+    setIsTexturing(true);
+    setError(null);
+    try {
+      const res = await fetch('/api/media/generate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: matPrompt, kind: 'texture' }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) throw new Error(data.error || `texture endpoint ${res.status}`);
+      const tex = await loadTexture(data.url);
+      applyTriplanarToGroup(generatedGroup, tex, {
+        metalness: lastProgram?.metalness,
+        roughness: lastProgram?.roughness,
+      });
+      setTextureInfo(matPrompt.slice(0, 48));
+      setTextureText('');
+    } catch (e: any) {
+      setError(`Texture failed: ${e?.message || e}`);
+    } finally {
+      setIsTexturing(false);
+    }
+  }, [generatedGroup, textureText, label, prompt, lastProgram]);
+
+  // Photo→3D: vision model describes the object, the SDF composer builds the
+  // geometry from that description, and the photo itself becomes the albedo.
+  const generateFromPhoto = useCallback(async (file: File) => {
+    setIsPhotoLoading(true);
+    setError(null);
+    try {
+      const dataUrl = await photoToDataUrl(file);
+      const res = await fetch('/api/media/describe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image: dataUrl }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) throw new Error(data.error || `describe endpoint ${res.status}`);
+      const description = String(data.description || '').trim();
+      if (!description) throw new Error('vision model returned no description');
+      setPrompt(description.slice(0, 220));
+      await runForge(description, dataUrl);
+    } catch (e: any) {
+      setError(`Photo→3D failed: ${e?.message || e}`);
+    } finally {
+      setIsPhotoLoading(false);
+    }
+  }, [runForge, setPrompt]);
 
   const surprise = useCallback(() => {
     const idea = PROMPT_IDEAS[Math.floor(Math.random() * PROMPT_IDEAS.length)];
@@ -212,37 +288,10 @@ export function Viewport3DSection() {
     a.click();
   }, [blobUrl, label]);
 
-  // Quick preset buttons (deterministic, no API needed) — wire to PRESET_PROGRAMS.
-  const loadPreset = useCallback(async (key: keyof typeof PRESET_PROGRAMS) => {
-    setIsGenerating(true);
-    setError(null);
-    loadStart.current = performance.now();
-    try {
-      const program = PRESET_PROGRAMS[key];
-      const compiled = await compileProgramAuto(program);
-      const blob = await exportGLB(compiled.group);
-      setBlobUrl(prev => { if (prev) URL.revokeObjectURL(prev); return URL.createObjectURL(blob); });
-      setGeneratedGroup(compiled.group);
-      setLastProgram(program);
-      setLabel(program.label);
-      setMode('ai');
-      setStats({
-        triangles: compiled.triangles, opCount: compiled.opCount, backend: 'preset',
-        resolution: compiled.resolution, fieldMs: compiled.fieldMs,
-        bytes: blob.size, loadMs: Math.round(performance.now() - loadStart.current), source: 'preset',
-      });
-    } catch (e: any) {
-      setError(`Preset failed: ${e?.message || e}`);
-    } finally {
-      setIsGenerating(false);
-    }
-  }, [setMode]);
-
   const backendIcon = useMemo(() => {
     if (!stats) return null;
     if (stats.backend === 'gpu') return <><Cpu className="w-3 h-3" /> GPU · WebGPU</>;
-    if (stats.backend === 'cpu') return <><Cpu className="w-3 h-3" /> CPU · marching-tet</>;
-    return <><Zap className="w-3 h-3" /> preset</>;
+    return <><Cpu className="w-3 h-3" /> CPU · marching-tet</>;
   }, [stats]);
 
   return (
@@ -272,8 +321,8 @@ export function Viewport3DSection() {
         <div className="absolute top-4 left-4 z-10 flex flex-col gap-2 w-96 max-w-[calc(100%-2rem)]">
           <div className="flex gap-2 flex-wrap">
             <div className="px-3 py-1.5 bg-slate-950/80 backdrop-blur border border-slate-700 rounded text-xs font-mono text-indigo-400 flex items-center gap-2">
-              <span className={`w-2 h-2 rounded-full ${isGenerating || isRefining ? 'bg-amber-400 animate-pulse' : stats ? 'bg-emerald-400' : 'bg-slate-500'}`} />
-              {isGenerating ? 'GENERATING' : isRefining ? 'REFINING' : stats ? 'MESH READY' : 'IDLE'}
+              <span className={`w-2 h-2 rounded-full ${isGenerating || isRefining || isTexturing || isPhotoLoading ? 'bg-amber-400 animate-pulse' : stats ? 'bg-emerald-400' : (previewProgram || lastProgram) ? 'bg-violet-400 animate-pulse' : 'bg-slate-500'}`} />
+              {isPhotoLoading ? 'READING PHOTO' : isGenerating ? 'GENERATING' : isRefining ? 'REFINING' : isTexturing ? 'TEXTURING' : stats ? 'MESH READY' : (previewProgram || lastProgram) && !generatedGroup ? 'PREVIEWING' : 'IDLE'}
             </div>
             {stats && (
               <div className="px-3 py-1.5 bg-slate-950/80 backdrop-blur border border-slate-700 rounded text-xs font-mono text-slate-300 flex items-center gap-1.5">
@@ -314,6 +363,26 @@ export function Viewport3DSection() {
             >
               <Sparkles className="w-4 h-4" />
             </button>
+            <button
+              type="button"
+              onClick={() => photoInputRef.current?.click()}
+              disabled={isPhotoLoading || isGenerating}
+              title="Generate from a photo — the AI describes it, builds the model, and wraps it in the photo's surface"
+              className="px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed border border-slate-700 text-slate-200 rounded flex items-center justify-center transition-colors"
+            >
+              {isPhotoLoading ? <div className="w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin" /> : <ImagePlus className="w-4 h-4" />}
+            </button>
+            <input
+              ref={photoInputRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(e) => {
+                const file = e.target.files?.[0];
+                e.target.value = ''; // allow re-selecting the same file
+                if (file) generateFromPhoto(file);
+              }}
+            />
           </form>
 
           {lastProgram && (
@@ -340,18 +409,30 @@ export function Viewport3DSection() {
             </form>
           )}
 
-          <div className="flex flex-wrap gap-1 mt-1">
-            <span className="text-[10px] font-mono text-slate-500 self-center mr-1">PRESETS:</span>
-            {(Object.keys(PRESET_PROGRAMS) as (keyof typeof PRESET_PROGRAMS)[]).map(k => (
+          {generatedGroup && (
+            <form
+              onSubmit={(e) => { e.preventDefault(); applyTexture(); }}
+              className="flex gap-2"
+            >
+              <input
+                type="text"
+                placeholder="Texture…  e.g. 'weathered bronze', 'oak bark' (blank = auto)"
+                value={textureText}
+                onChange={(e) => setTextureText(e.target.value)}
+                disabled={isTexturing}
+                className="flex-1 bg-slate-950/80 backdrop-blur border border-slate-700 rounded px-3 py-2 text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-fuchsia-500 disabled:opacity-50"
+              />
               <button
-                key={k}
-                onClick={() => loadPreset(k)}
-                className="px-2 py-1 text-[10px] font-mono bg-slate-800/80 hover:bg-slate-700 border border-slate-700 text-slate-300 rounded transition-colors"
+                type="submit"
+                disabled={isTexturing || isGenerating}
+                title="Generate a seamless material and project it onto the mesh (triplanar)"
+                className="px-3 py-2 bg-fuchsia-600 hover:bg-fuchsia-500 disabled:bg-fuchsia-600/40 disabled:cursor-not-allowed text-white rounded flex items-center justify-center transition-colors"
               >
-                {k}
+                {isTexturing ? <div className="w-4 h-4 rounded-full border-2 border-white/30 border-t-white animate-spin" /> : <Paintbrush className="w-4 h-4" />}
               </button>
-            ))}
-          </div>
+            </form>
+          )}
+
         </div>
 
         {/* Top-right: viewport controls */}
@@ -359,31 +440,6 @@ export function Viewport3DSection() {
           <h3 className="text-sm font-semibold text-slate-200 border-b border-slate-800 pb-2 flex items-center gap-2">
             <Cog className="w-4 h-4" /> Controls
           </h3>
-
-          <div className="space-y-2">
-            <label className="text-xs text-slate-400 font-medium">View</label>
-            <div className="grid grid-cols-2 gap-1">
-              <button
-                onClick={() => setMode('ai')}
-                className={`py-1.5 text-xs rounded border ${mode === 'ai' ? 'bg-indigo-500/20 border-indigo-500 text-indigo-300' : 'bg-slate-800 border-transparent text-slate-400 hover:bg-slate-700'}`}
-              >AI Mesh</button>
-              <button
-                onClick={() => setMode('humanoid')}
-                className={`py-1.5 text-xs rounded border ${mode === 'humanoid' ? 'bg-indigo-500/20 border-indigo-500 text-indigo-300' : 'bg-slate-800 border-transparent text-slate-400 hover:bg-slate-700'}`}
-              >Rigs</button>
-            </div>
-            {mode !== 'ai' && (
-              <div className="grid grid-cols-3 gap-1 mt-1">
-                {(['humanoid', 'animal', 'mechanical'] as const).map(k => (
-                  <button
-                    key={k}
-                    onClick={() => setMode(k)}
-                    className={`py-1 text-[10px] rounded border ${mode === k ? 'bg-indigo-500/20 border-indigo-500 text-indigo-300' : 'bg-slate-800 border-transparent text-slate-400 hover:bg-slate-700'}`}
-                  >{k.slice(0, 4)}</button>
-                ))}
-              </div>
-            )}
-          </div>
 
           <div className="space-y-2">
             <button
@@ -438,6 +494,7 @@ export function Viewport3DSection() {
             <div className="flex justify-between"><span className="text-slate-500">field</span><span className="text-slate-300">{stats.fieldMs} ms</span></div>
             <div className="flex justify-between"><span className="text-slate-500">total</span><span className="text-slate-300">{stats.loadMs} ms</span></div>
             <div className="flex justify-between"><span className="text-slate-500">glb size</span><span className="text-slate-300">{(stats.bytes / 1024).toFixed(1)} KB</span></div>
+            {textureInfo && <div className="flex justify-between"><span className="text-slate-500">texture</span><span className="text-fuchsia-300 truncate max-w-[140px]" title={`${textureInfo} — triplanar projection (viewport); .glb keeps vertex colors`}>{textureInfo}</span></div>}
           </div>
         )}
 
@@ -447,11 +504,16 @@ export function Viewport3DSection() {
           <spotLight position={[10, 10, 10]} angle={0.15} penumbra={1} intensity={spotIntensity} castShadow />
           <pointLight position={[-10, -10, -10]} intensity={0.5} />
 
-          {mode === 'ai' && generatedGroup && <GeneratedMesh group={generatedGroup} spin={spin} />}
-          {mode === 'ai' && !generatedGroup && (
-            <PresetRig kind="mechanical" spin={spin} />
+          {generatedGroup && <GeneratedMesh group={generatedGroup} spin={spin} />}
+          {/* 3D-2: live raymarch preview — shows while the user types or while
+              generation is running.  Priority: real mesh > AI program > local
+              preview program.  The SDFRaytracer renders a full-screen
+              sphere-traced SDF image; it disappears the moment the real
+              polygonized mesh is ready.  With nothing to show, the empty
+              grid awaits a prompt — no canned placeholder models. */}
+          {!generatedGroup && (lastProgram ?? previewProgram) && (
+            <SDFRaytracer program={(lastProgram ?? previewProgram)!} />
           )}
-          {mode !== 'ai' && <PresetRig kind={mode} spin={spin} />}
 
           <ContactShadows position={[0, -0.01, 0]} opacity={0.4} scale={10} blur={2} far={4} />
           <Grid infiniteGrid fadeDistance={20} fadeStrength={5} sectionColor="#334155" cellColor="#1e293b" />

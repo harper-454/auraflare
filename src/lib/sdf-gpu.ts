@@ -15,6 +15,7 @@
 import * as THREE from 'three';
 import type { ShapeProgram, PrimOp } from './sdf-compiler';
 import { BOUND, polygonizeField, evaluateFieldCPU, expandProgram } from './sdf-compiler';
+import { makeSDFMaterial } from './sdf-material';
 
 export interface CompileResult {
   group: THREE.Group;
@@ -25,19 +26,25 @@ export interface CompileResult {
   fieldMs: number;
 }
 
-// Only the original 5 primitives are implemented in the WGSL kernel (sdPrim
-// branches t==0..4). cone/hex/octahedron + warp route to the CPU pipeline via
-// compileProgramAuto's gpuCompatible gate, so they never reach packOps.
-const PRIM_ID: Partial<Record<PrimOp['prim'], number>> = { sphere: 0, box: 1, capsule: 2, torus: 3, ellipsoid: 4 };
+// All 8 primitives are implemented in the WGSL kernel (sdPrim branches t==0..7)
+// and the fBm warp modifier runs on the GPU too, so every program the CPU can
+// polygonize now has a full-resolution GPU path. The WGSL formulations are exact
+// ports of the CPU ones in sdf-compiler.ts — the two backends must agree so
+// switching between them never changes the mesh.
+export const PRIM_ID: Record<PrimOp['prim'], number> = { sphere: 0, box: 1, capsule: 2, torus: 3, ellipsoid: 4, cone: 5, hex: 6, octahedron: 7 };
 const MODE_ID: Record<NonNullable<PrimOp['mode']>, number> = { union: 0, smooth: 1, subtract: 2, intersect: 3 };
 const FLOATS_PER_OP = 24; // 6 × vec4
-const MAX_TRIS = 350_000;
+// 500k tris = 18 MB per attribute buffer (pos/nrm/col) — comfortably under the
+// default 128 MB storage-binding limit, and enough headroom that a dense
+// warp-heavy organic at 144³ doesn't clip against the atomic allocator cap.
+const MAX_TRIS = 500_000;
 
 const MESH_WGSL = /* wgsl */ `
 struct Params {
   origin : vec4<f32>,   // xyz = lattice origin
-  meta   : vec4<f32>,   // x = cell step, y = gradient h
+  cfg    : vec4<f32>,   // x = cell step, y = gradient h  (NOT 'meta' — reserved word in WGSL)
   dims   : vec4<u32>,   // x = N cells per axis, y = op count, z = max tris
+  warp   : vec4<f32>,   // x = amp (0 = off), y = freq, z = octaves, w = seed
 };
 @group(0) @binding(0) var<uniform> P : Params;
 @group(0) @binding(1) var<storage, read> ops : array<vec4<f32>>;
@@ -75,16 +82,83 @@ fn sdPrim(base : u32, wp : vec3<f32>) -> f32 {
     let qq = vec2<f32>(length(p.xz) - pr.x, p.y);
     return length(qq) - pr.y;
   }
-  let s  = max(pr.xyz, vec3<f32>(1e-4));
-  let k0 = length(p / s);
-  let k1 = length(p / (s * s));
-  if (k1 < 1e-9) { return -min(s.x, min(s.y, s.z)); }
-  return k0 * (k0 - 1.0) / k1;
+  if (t == 4u) {
+    let s  = max(pr.xyz, vec3<f32>(1e-4));
+    let k0 = length(p / s);
+    let k1 = length(p / (s * s));
+    if (k1 < 1e-9) { return -min(s.x, min(s.y, s.z)); }
+    return k0 * (k0 - 1.0) / k1;
+  }
+  if (t == 5u) {
+    // cone: circular base radius pr.x on XZ (y=0), apex at (0, pr.y, 0).
+    // Faithful port of the CPU IQ cone (sign term uses the 2D cross product).
+    let r  = pr.x;
+    let hh = pr.y;
+    let wx = length(p.xz);
+    let wy = p.y - hh;
+    let qx = r;
+    let qy = -hh;
+    let tt = clamp((wx * qx + wy * qy) / (qx * qx + qy * qy), 0.0, 1.0);
+    let ax = wx - qx * tt;
+    let ay = wy - qy * tt;
+    let cbx = wx - qx * clamp(wx / qx, 0.0, 1.0);
+    let cby = wy - qy;
+    let dd = min(ax * ax + ay * ay, cbx * cbx + cby * cby);
+    let sgn = max(-(wx * qy - wy * qx), -(wy - qy));
+    return sqrt(dd) * sign(sgn);
+  }
+  if (t == 6u) {
+    // hexagonal prism extruded along Y (matches CPU approximation).
+    let ax = abs(p.x);
+    let az = abs(p.z);
+    let hx = az * 0.8660254 + ax * 0.5;
+    var d2 = max(hx, az) - pr.x;
+    d2 = max(d2, ax - pr.x);
+    return max(d2, abs(p.y) - pr.y);
+  }
+  // t == 7u: octahedron (bound approximation, matches CPU).
+  return (abs(p.x) + abs(p.y) + abs(p.z) - pr.x) * 0.57735027;
 }
 
 fn sminf(a : f32, b : f32, k : f32) -> f32 {
   let h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
   return mix(b, a, h) - k * h * (1.0 - h);
+}
+
+// ── fBm value-noise warp (exact port of sdf-compiler.ts) ──
+// Displaces the field to carve organic bark/coral/rock detail. The fract(sin)
+// hash is the canonical shader hash; CPU and GPU agree to visual precision.
+fn hash3(ix : f32, iy : f32, iz : f32, seed : f32) -> f32 {
+  let h = sin(ix * 127.1 + iy * 311.7 + iz * 74.7 + seed * 53.3) * 43758.5453;
+  return h - floor(h);
+}
+fn valueNoise3D(x : f32, y : f32, z : f32, seed : f32) -> f32 {
+  let ix = floor(x); let iy = floor(y); let iz = floor(z);
+  let fx = x - ix; let fy = y - iy; let fz = z - iz;
+  let ux = fx * fx * (3.0 - 2.0 * fx);
+  let uy = fy * fy * (3.0 - 2.0 * fy);
+  let uz = fz * fz * (3.0 - 2.0 * fz);
+  let c000 = hash3(ix, iy, iz, seed);           let c100 = hash3(ix + 1.0, iy, iz, seed);
+  let c010 = hash3(ix, iy + 1.0, iz, seed);     let c110 = hash3(ix + 1.0, iy + 1.0, iz, seed);
+  let c001 = hash3(ix, iy, iz + 1.0, seed);     let c101 = hash3(ix + 1.0, iy, iz + 1.0, seed);
+  let c011 = hash3(ix, iy + 1.0, iz + 1.0, seed); let c111 = hash3(ix + 1.0, iy + 1.0, iz + 1.0, seed);
+  let x00 = mix(c000, c100, ux);
+  let x10 = mix(c010, c110, ux);
+  let x01 = mix(c001, c101, ux);
+  let x11 = mix(c011, c111, ux);
+  let y0 = mix(x00, x10, uy);
+  let y1 = mix(x01, x11, uy);
+  return mix(y0, y1, uz);
+}
+fn fbm3D(px : f32, py : f32, pz : f32, octaves : u32, seed : f32) -> f32 {
+  var amp = 0.5; var sum = 0.0; var norm = 0.0;
+  var x = px; var y = py; var z = pz;
+  for (var i = 0u; i < octaves; i = i + 1u) {
+    sum = sum + amp * valueNoise3D(x, y, z, seed + f32(i) * 17.0);
+    norm = norm + amp;
+    x = x * 2.0; y = y * 2.0; z = z * 2.0; amp = amp * 0.5;
+  }
+  return sum / norm;
 }
 
 fn sdProgram(wp : vec3<f32>) -> f32 {
@@ -99,11 +173,16 @@ fn sdProgram(wp : vec3<f32>) -> f32 {
     else if (mode == 3u) { d = max(d, di); }
     else                 { d = min(d, di); }
   }
+  // Optional fBm displacement (±amp around the clean surface) — matches CPU.
+  if (P.warp.x > 0.0) {
+    let n = fbm3D(wp.x * P.warp.y, wp.y * P.warp.y, wp.z * P.warp.y, u32(P.warp.z), P.warp.w);
+    d = d - P.warp.x * (n - 0.5) * 2.0;
+  }
   return d;
 }
 
 fn gradientAt(wp : vec3<f32>) -> vec3<f32> {
-  let h = P.meta.y;
+  let h = P.cfg.y;
   let g = vec3<f32>(
     sdProgram(wp + vec3<f32>(h, 0.0, 0.0)) - sdProgram(wp - vec3<f32>(h, 0.0, 0.0)),
     sdProgram(wp + vec3<f32>(0.0, h, 0.0)) - sdProgram(wp - vec3<f32>(0.0, h, 0.0)),
@@ -163,7 +242,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = cell % N;
   let j = (cell / N) % N;
   let k = cell / (N * N);
-  let step = P.meta.x;
+  let step = P.cfg.x;
   let base = P.origin.xyz + vec3<f32>(f32(i), f32(j), f32(k)) * step;
 
   var cp : array<vec3<f32>, 8>;
@@ -228,7 +307,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>) {
 }
 `;
 
-function packOps(program: ShapeProgram): Float32Array {
+export function packOps(program: ShapeProgram): Float32Array {
   const out = new Float32Array(program.ops.length * FLOATS_PER_OP);
   program.ops.forEach((op, i) => {
     const o = i * FLOATS_PER_OP;
@@ -275,6 +354,13 @@ function packOps(program: ShapeProgram): Float32Array {
         out[o + 20] = s[0]; out[o + 21] = s[1]; out[o + 22] = s[2];
         break;
       }
+      case 'cone': out[o + 20] = op.r ?? 0.3; out[o + 21] = op.h ?? 0.6; break;
+      case 'hex': {
+        const s = op.size ?? [0.35, 0.3, 0.3];
+        out[o + 20] = s[0]; out[o + 21] = s[1];
+        break;
+      }
+      case 'octahedron': out[o + 20] = op.r ?? 0.4; break;
     }
   });
   return out;
@@ -291,7 +377,7 @@ function getDevice(): Promise<GPUDevice | null> {
         const adapter = await gpu.requestAdapter();
         if (!adapter) return null;
         const device: GPUDevice = await adapter.requestDevice();
-        device.lost.then(() => { devicePromise = null; });
+        device.lost.then(() => { devicePromise = null; pipelineCache = null; });
         return device;
       } catch {
         return null;
@@ -299,6 +385,33 @@ function getDevice(): Promise<GPUDevice | null> {
     })();
   }
   return devicePromise;
+}
+
+// The WGSL kernel is static — only the storage buffers (ops) and uniform (dims)
+// change per generation. Compiling it is EXPENSIVE (~7 s on some drivers; it
+// inlines sdProgram ~24× through gradientAt/colorAt/emitTri), so compile it once
+// per device and reuse. Without this cache the compile ran on every generate,
+// which was the entire cost of a "24 s" model. Async compile keeps the main
+// thread responsive; the promise is cached so concurrent callers share one build.
+let pipelineCache: { device: GPUDevice; pipeline: Promise<GPUComputePipeline> } | null = null;
+
+function getPipeline(device: GPUDevice): Promise<GPUComputePipeline> {
+  if (pipelineCache && pipelineCache.device === device) return pipelineCache.pipeline;
+  const module = device.createShaderModule({ code: MESH_WGSL });
+  const pipeline = device.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+  pipelineCache = { device, pipeline };
+  return pipeline;
+}
+
+/**
+ * Warm the GPU device + kernel compilation ahead of the first generation.
+ * Call this when the 3D surface mounts: the ~7 s one-time shader compile then
+ * overlaps with the user reading the UI / typing a prompt, so their first
+ * "Generate" feels instant instead of paying the compile cost inline.
+ * Fire-and-forget; safe to call repeatedly (the device + pipeline are cached).
+ */
+export function warmupGPU(): void {
+  getDevice().then(d => { if (d) getPipeline(d).catch(() => {}); }).catch(() => {});
 }
 
 /**
@@ -316,16 +429,18 @@ export async function generateMeshGPU(program: ShapeProgram, resolution: number)
   const cells = N * N * N;
   const step = (BOUND * 2) / N;
 
-  const module = device.createShaderModule({ code: MESH_WGSL });
-  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module, entryPoint: 'main' } });
+  const pipeline = await getPipeline(device);
 
-  const uni = new ArrayBuffer(48);
+  const uni = new ArrayBuffer(64);
   const f32 = new Float32Array(uni);
   const u32 = new Uint32Array(uni);
   f32[0] = -BOUND; f32[1] = -BOUND; f32[2] = -BOUND;
   f32[4] = step; f32[5] = step * 0.5;                 // gradient h
   u32[8] = N; u32[9] = program.ops.length; u32[10] = MAX_TRIS;
-  const uniform = device.createBuffer({ size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  // warp vec4 (offset 48): amp, freq, octaves, seed. amp=0 disables the branch.
+  const w = program.warp;
+  f32[12] = w?.amp ?? 0; f32[13] = w?.freq ?? 6; f32[14] = w?.octaves ?? 4; f32[15] = w?.seed ?? 0;
+  const uniform = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   device.queue.writeBuffer(uniform, 0, uni);
 
   const packed = packOps(program);
@@ -390,20 +505,24 @@ export async function generateMeshGPU(program: ShapeProgram, resolution: number)
 
 /**
  * Compile with the best backend: fused GPU marching-tets at high resolution,
- * or the deterministic CPU pipeline when WebGPU is unavailable OR the program
- * uses features the WGSL kernel doesn't yet support.
+ * or the deterministic CPU pipeline when WebGPU is unavailable.
  *
- * The GPU kernel currently implements only the original 5 primitives
- * (sphere/box/capsule/torus/ellipsoid) and has no fBm warp. When a program
- * uses cone/hex/octahedron, the warp modifier, or symmetries/parts that expand
- * to >64 ops, we route straight to CPU for correctness. This keeps the GPU
- * fast path for the common case and never produces a wrong mesh.
+ * The WGSL kernel now implements all 8 primitives AND the fBm warp, so every
+ * program the CPU can polygonize has a full-resolution GPU path — the newest,
+ * most impressive shapes (crystals, gems, spiked/warped organics) no longer
+ * drop to the low-res CPU fallback. We only route to CPU when WebGPU is missing
+ * or the expanded op count exceeds the kernel's budget.
  */
-export async function compileProgramAuto(program: ShapeProgram, gpuRes = 112, cpuRes = 60): Promise<CompileResult> {
+// 144³ lattice: ~2.1× the cells of the old 112³ default, still a few-hundred-ms
+// dispatch on the cached pipeline (compute was never the bottleneck — the one-time
+// shader compile was), and visibly sharper edges/fillets on every model.
+export async function compileProgramAuto(program: ShapeProgram, gpuRes = 144, cpuRes = 60): Promise<CompileResult> {
   const expanded = expandProgram(program);
-  const gpuSupportedPrims = new Set(['sphere', 'box', 'capsule', 'torus', 'ellipsoid']);
-  const gpuCompatible = !expanded.warp
-    && expanded.ops.length <= 24
+  // Kernel supports every primitive + warp; the only bound is op count (matches
+  // expandProgram's own cap). The prim check stays as a defensive guard so an
+  // unrecognized future primitive falls back to CPU instead of packing as sphere.
+  const gpuSupportedPrims = new Set(['sphere', 'box', 'capsule', 'torus', 'ellipsoid', 'cone', 'hex', 'octahedron']);
+  const gpuCompatible = expanded.ops.length <= 64
     && expanded.ops.every(o => gpuSupportedPrims.has(o.prim));
 
   if (gpuCompatible) {
@@ -413,12 +532,7 @@ export async function compileProgramAuto(program: ShapeProgram, gpuRes = 112, cp
       // op on the GPU path (e.g. a flower rendering with no petals).
       const gpu = await generateMeshGPU(expanded, gpuRes);
       if (gpu && gpu.triangles > 0) {
-        const material = new THREE.MeshStandardMaterial({
-          vertexColors: true,
-          metalness: program.metalness ?? 0.15,
-          roughness: program.roughness ?? 0.55,
-          side: THREE.DoubleSide,
-        });
+        const material = makeSDFMaterial({ metalness: program.metalness, roughness: program.roughness });
         const mesh = new THREE.Mesh(gpu.geometry, material);
         mesh.name = program.label || 'sdf-model';
         const group = new THREE.Group();

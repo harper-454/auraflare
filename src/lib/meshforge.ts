@@ -13,6 +13,7 @@
  */
 import * as THREE from 'three';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+import { aiChatSync } from './ai-providers';
 
 export interface ShapeSpec {
   base: 'organic' | 'vessel' | 'crystal' | 'planet' | 'stack' | 'ring';
@@ -389,25 +390,16 @@ export function exportGLB(group: THREE.Group): Promise<Blob> {
   });
 }
 
-/** Ask the local AI endpoint to do the semantic parse; falls back to keywords. */
+/** Ask the AI provider chain to do the semantic parse; falls back to keywords. */
 export async function parsePromptWithAI(prompt: string): Promise<{ spec: ShapeSpec; source: 'ai' | 'local' }> {
   const fallback = parsePromptLocally(prompt);
   try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 9000);
-    const res = await fetch('/api/chat-sync', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      body: JSON.stringify({
-        context: '3d-generator',
-        message: `Convert this 3D model description into JSON. Reply with ONLY a JSON object, no prose, no code fences. Schema: {"base":"organic|vessel|crystal|planet|stack|ring","colorA":"#hex","colorB":"#hex","metalness":0-1,"roughness":0-1,"distortion":0-1,"twist":0-1,"emissive":bool,"texture":"noise|stripes|splatter|none","label":"short name"}. Description: "${prompt}"`,
-      }),
-    });
-    clearTimeout(timer);
-    if (!res.ok) throw new Error(String(res.status));
-    const data = await res.json();
-    const match = String(data.text ?? '').match(/\{[\s\S]*\}/);
+    const { text } = await aiChatSync(
+      `Convert this 3D model description into JSON. Reply with ONLY a JSON object, no prose, no code fences. Schema: {"base":"organic|vessel|crystal|planet|stack|ring","colorA":"#hex","colorB":"#hex","metalness":0-1,"roughness":0-1,"distortion":0-1,"twist":0-1,"emissive":bool,"texture":"noise|stripes|splatter|none","label":"short name"}. Description: "${prompt}"`,
+      '3d-generator',
+      9000,
+    );
+    const match = text.match(/\{[\s\S]*\}/);
     if (!match) throw new Error('no json');
     const raw = JSON.parse(match[0]);
     const bases: ShapeSpec['base'][] = ['organic', 'vessel', 'crystal', 'planet', 'stack', 'ring'];
