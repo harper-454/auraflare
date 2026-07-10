@@ -529,7 +529,7 @@ export async function compileProgramAuto(program: ShapeProgram, gpuRes = 144, cp
   // expandProgram's own cap). The prim check stays as a defensive guard so an
   // unrecognized future primitive falls back to CPU instead of packing as sphere.
   const gpuSupportedPrims = new Set(['sphere', 'box', 'capsule', 'torus', 'ellipsoid', 'cone', 'hex', 'octahedron', 'cylinder']);
-  const gpuCompatible = expanded.ops.length <= 64
+  const gpuCompatible = expanded.ops.length <= 96
     && expanded.ops.every(o => gpuSupportedPrims.has(o.prim));
 
   if (gpuCompatible) {

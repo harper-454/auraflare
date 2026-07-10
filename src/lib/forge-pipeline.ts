@@ -32,6 +32,7 @@ export interface ForgeOptions {
   ground?: boolean;   // pull reference photos (default true)
   qa?: boolean;       // pre-delivery inspection round (default true)
   useCache?: boolean; // reuse/store the program cache (default true)
+  detail?: boolean;   // pass-3 surface-detail round on complex composes (default true)
 }
 
 export interface ForgeResult {
@@ -180,7 +181,7 @@ export async function forgeModel(
   opts: ForgeOptions = {},
   onStage?: (stage: ForgeStage) => void,
 ): Promise<ForgeResult> {
-  const { ground = true, qa = true, useCache = true } = opts;
+  const { ground = true, qa = true, useCache = true, detail = true } = opts;
 
   if (useCache) {
     const hit = cachedProgram(prompt);
@@ -202,7 +203,7 @@ export async function forgeModel(
   }
 
   onStage?.('composing');
-  const composed = (wantsComplexCompose(prompt) ? await composeComplexWithAI(prompt, refNotes) : null)
+  const composed = (wantsComplexCompose(prompt) ? await composeComplexWithAI(prompt, refNotes, { detail }) : null)
     ?? await composeWithAI(prompt, refNotes);
   let program = composed?.program ?? buildPreviewProgram(prompt);
   if (!program) throw new Error('no composer produced a program');

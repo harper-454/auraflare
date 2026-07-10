@@ -364,7 +364,10 @@ export function expandProgram(program: ShapeProgram): ShapeProgram {
   }
 
   // Cap at 64 ops total so a runaway LLM can't blow up the polygonizer.
-  return { ...program, ops: ops.slice(0, 64) };
+  // 96: the 10x-detail budget. The WGSL kernel reads ops from a dynamically
+  // sized storage buffer, so the only cost is compute (~+50% on op-heavy
+  // models) — the cached pipeline absorbs it.
+  return { ...program, ops: ops.slice(0, 96) };
 }
 
 function axisIndex(ax: 'x' | 'y' | 'z'): 0 | 1 | 2 {
@@ -643,7 +646,7 @@ function sanitizeParts(raw: any): PartDef[] | undefined {
   const parts: PartDef[] | undefined = Array.isArray(raw) && raw.length
     ? raw.slice(0, 12).map((p: any) => ({
         name: String(p.name || 'part').slice(0, 24),
-        ops: (Array.isArray(p.ops) ? p.ops : []).slice(0, 16)
+        ops: (Array.isArray(p.ops) ? p.ops : []).slice(0, 24)
           .map((o: any) => { const prim = o ? resolvePrim(o.prim) : null; return prim ? { ...o, prim } : null; })
           .filter(Boolean),
       })).filter((p: PartDef) => p.ops.length > 0)
@@ -686,7 +689,7 @@ function sanitizeAssemblies(raw: any): Assembly[] | undefined {
   const out: Assembly[] = [];
   for (const a of raw.slice(0, 12)) {
     if (!a || typeof a !== 'object') continue;
-    const ops = sanitizeOps(a.ops, 24);
+    const ops = sanitizeOps(a.ops, 32);
     if (!ops.length) continue;
     let name = String(a.name || `part-${out.length + 1}`).toLowerCase().replace(/[^a-z0-9-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 32) || `part-${out.length + 1}`;
     while (seen.has(name)) name = `${name}-2`;
@@ -713,7 +716,7 @@ function sanitizeAssemblies(raw: any): Assembly[] | undefined {
 
 export function sanitizeProgram(raw: any, fallbackLabel: string): ShapeProgram | null {
   if (!raw || typeof raw !== 'object') return null;
-  const ops = sanitizeOps(raw.ops, 24);
+  const ops = sanitizeOps(raw.ops, 40);
   const assemblies = sanitizeAssemblies(raw.assemblies);
   // Valid when the static ops OR the articulated parts carry real geometry.
   const totalOps = ops.length + (assemblies?.reduce((n, a) => n + a.ops.length, 0) ?? 0);
@@ -760,7 +763,7 @@ export function flattenProgram(p: ShapeProgram): ShapeProgram {
     const pr = a.place.rot ?? [0, 0, 0];
     q.setFromEuler(e.set((pr[0] * Math.PI) / 180, (pr[1] * Math.PI) / 180, (pr[2] * Math.PI) / 180));
     for (const op of expanded.ops) {
-      if (ops.length >= 64) return { ...p, ops, assemblies: undefined };
+      if (ops.length >= 96) return { ...p, ops, assemblies: undefined };
       v.set(op.pos[0] * s, op.pos[1] * s, op.pos[2] * s).applyQuaternion(q);
       const oRot = op.rot ?? [0, 0, 0];
       qOp.setFromEuler(e.set((oRot[0] * Math.PI) / 180, (oRot[1] * Math.PI) / 180, (oRot[2] * Math.PI) / 180));
@@ -849,7 +852,7 @@ STRUCTURAL DECOMPOSITION — what makes an object RECOGNIZABLE (this is where mo
 - FLAT surfaces (table tops, seats, screens, roofs): boxes or short cylinders (small h), NOT ellipsoids.
 
 RULES:
-- Everything must fit inside [-1.2, 1.2] on every axis. Y is UP. Build 6-20 ops (or fewer ops + symmetries).
+- Everything must fit inside [-1.2, 1.2] on every axis. Y is UP. Build 12-40 ops (or fewer ops + symmetries) — sparse models read as toys; real objects carry rims, trim, feet, seams, fasteners.
 - UNDER-MODELING IS THE #1 FAILURE. Fewer than 5 ops is almost never enough for a real object: model the main mass, every structural feature the name implies (cavity, handle, legs, lid, spout…), then at least one detail layer.
 - Think like a modeler: silhouette first, then structural features, then details. Use "smooth" mode + blend to fuse organic parts; use crisp "union" for machined parts.
 - Honor shape adjectives LITERALLY: "round table top" = short cylinder (never a box); "square/rectangular" = box; "pointed" = cone; "curved handle" = torus.
@@ -935,16 +938,17 @@ ${''}Use the same primitive/CSG/symmetry language as the main compiler:
 - prims: sphere(r) box(size=half-extents) ellipsoid(size) capsule(pos→pos+size,r) cylinder(r, h=half-height — man-made round parts: wheels, shafts, cans) torus(R,r) cone(r,h) hex(size=[radial,halfH,_]) octahedron(r)
 - modes: union | smooth(blend 0.06-0.15) | subtract | intersect — ops apply in order
 - "parts"+"symmetries" DSL per assembly: e.g. a gear = hex body + {"kind":"radial","of":"tooth","count":12,"radius":0.95,"axis":"y","spin":true} over a small box tooth
-Give each part 4-10 ops (hero parts up to 16). Realistic per-part colors; metals get metalness 0.7-0.95, roughness 0.15-0.4.
+Give each part 8-16 ops (hero parts up to 24). Model EVERY line of the VISUAL SPEC — a part or DETAIL listed there that has no ops is a failure. Realistic per-part colors; metals get metalness 0.7-0.95, roughness 0.15-0.4.
 Reply with ONLY JSON: {"assemblies":[{"name":"<exact planned name>","ops":[...],"parts":[...] optional,"symmetries":[...] optional,"metalness":opt,"roughness":opt}, ...one per planned part...], "ops":[...optional static base ops in WORLD frame...]}`;
 
 /**
  * Two-pass compose for complex/mechanical objects. Falls back to null on any
  * failure — the caller then tries the single-shot composeWithAI.
  */
-export async function composeComplexWithAI(prompt: string, refNotes?: string | null): Promise<{ program: ShapeProgram; source: 'ai'; provider?: string } | null> {
+export async function composeComplexWithAI(prompt: string, refNotes?: string | null, opts?: { detail?: boolean }): Promise<{ program: ShapeProgram; source: 'ai'; provider?: string } | null> {
+  const detail = opts?.detail !== false;
   const grounding = refNotes
-    ? `\nREFERENCE NOTES — consensus distilled from real photos of this object; match these parts and proportions:\n${refNotes}\n`
+    ? `\nVISUAL SPEC — the numeric blueprint distilled from real photos of this object. Every PART and DETAIL line must exist in the geometry; shapes here may NOT get lost:\n${refNotes}\n`
     : '';
   try {
     const plan = await aiChatSync(`${PLAN_INSTRUCTIONS}${grounding} "${prompt}"`, 'sdf-shape-compiler-plan', 60000);
@@ -990,13 +994,43 @@ export async function composeComplexWithAI(prompt: string, refNotes?: string | n
       };
     });
 
-    const program = sanitizeProgram({
+    let program = sanitizeProgram({
       label: rawPlan.label || prompt.slice(0, 48),
       ops: Array.isArray(rawRefined?.ops) ? rawRefined.ops : [],
       assemblies,
       metalness: rawPlan.metalness,
       roughness: rawPlan.roughness,
     }, prompt.slice(0, 48));
+
+    // PASS 3 — surface detail. Additive only: rims, grooves, trim, fasteners,
+    // spokes; the silhouette is frozen. Accepted only when it grows the op
+    // count, so a bad reply can never degrade the model.
+    if (program && detail) {
+      try {
+        const detailReply = await aiChatSync(
+          `PASS 3 — you are the detailer of a 3D model factory. The program below is geometrically correct but too plain. ADD surface-detail ops only — rims (thin torus), grooves/panel lines (thin subtract boxes), trim, feet, fasteners (small cylinders/spheres, use symmetries for rows/rings), spouts, stitching ridges. NEVER move, remove, or resize existing ops; NEVER change the silhouette. Match every DETAILS line of the visual spec if one is given.${grounding}\nReply ONLY JSON: {"ops":[...new ops in WORLD frame for the static base...],"assemblies":[{"name":"<existing name>","addOps":[...new ops in that part's LOCAL frame...]}]} — 4-16 new ops total.\n\nOBJECT: "${prompt}"\nCURRENT PROGRAM:\n${JSON.stringify(program)}`,
+          'sdf-shape-compiler-detail',
+          60000,
+        );
+        const dm = detailReply.text.match(/\{[\s\S]*\}/);
+        if (dm) {
+          const add = JSON.parse(dm[0]);
+          const detailed = sanitizeProgram({
+            ...program,
+            ops: [...program.ops, ...(Array.isArray(add?.ops) ? add.ops : [])],
+            assemblies: program.assemblies?.map(a => {
+              const extra = (Array.isArray(add?.assemblies) ? add.assemblies : [])
+                .find((x: any) => x && typeof x.name === 'string' && x.name.toLowerCase().trim() === a.name);
+              return extra && Array.isArray(extra.addOps) && extra.addOps.length
+                ? { ...a, ops: [...a.ops, ...extra.addOps] }
+                : a;
+            }),
+          }, program.label);
+          if (detailed && totalProgramOps(detailed) > totalProgramOps(program)) program = detailed;
+        }
+      } catch { /* detail is a bonus round — never blocks */ }
+    }
+
     if (program && (program.assemblies?.length ?? 0) >= 2 && totalProgramOps(program) >= 4) {
       return { program, source: 'ai', provider: refined.provider };
     }
@@ -1008,8 +1042,10 @@ export async function composeComplexWithAI(prompt: string, refNotes?: string | n
 
 /** Prompts that smell mechanical/composite get the two-pass factory treatment. */
 export function wantsComplexCompose(prompt: string): boolean {
+  // 40 chars: any prompt descriptive enough to name features deserves the
+  // full plan → refine → detail factory, not just the single-shot composer.
   return /\b(watch|clock|engine|gear|machine|motor|mechanis|robot|turbine|windmill|fan|drone|helicopter|car|truck|vehicle|piston|pump|mill|carousel|ferris|propeller|wheel|clockwork|mechanical)\b/i.test(prompt)
-    || prompt.trim().length > 80;
+    || prompt.trim().length > 40;
 }
 
 /**

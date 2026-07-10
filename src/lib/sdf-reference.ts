@@ -10,6 +10,7 @@
  * GENERATED reference imagery (SDXL on the worker), per the owner's
  * "photos pulled online, or generated images if not online" directive.
  */
+import { aiChatSync } from './ai-providers';
 
 export interface ReferenceGrounding {
   notes: string | null;              // consensus notes for the LLM (null = ungrounded)
@@ -149,6 +150,47 @@ async function extractNotes(sheet: string, term: string): Promise<string | null>
   }
 }
 
+// The VLM is only asked to LOOK (small VLMs describe well but reason badly);
+// the strong text model turns the literal description into geometry language.
+const LITERAL_PROMPT = 'Describe this image exhaustively for a blind sculptor. Inventory EVERY visible part of the object: its geometric form (cylindrical, box-like, ring, cone, dome, tapered, curved plate…), its size compared to the whole object, where it attaches, how many there are, and every surface feature you can see (grooves, rims, spokes, buttons, panels, stitching, trim, feet). Plain sentences, one part per sentence. Do not summarize, do not interpret — just inventory what is visible.';
+
+const SPEC_PROMPT = `You convert a literal image description into a VISUAL SPEC for a 3D shape compiler — the blueprint it builds from, so NO shape may get lost. Use ONLY facts from the description (plus the object name for common sense); numbers, not adjectives. Reply with EXACTLY this format, ≤ 24 lines, no prose:
+OVERALL: <silhouette in one clause; proportions as W:H:D numbers, e.g. 1 : 1.4 : 1>
+PARTS: (one line per part — EVERY part in the description)
+- <name> | shape=<cylinder|box|ring|cone|sphere|dome|plate|tube|curved…> | size=<fractions of overall, e.g. h=0.15 d=0.9> | at=<where, e.g. top rim / centered under body> | count=<n> | <color/material>
+DETAILS: (surface features worth 1-3 ops each: grooves, rims, bolts, spokes, trim — with counts and placement)`;
+
+/**
+ * The 10x-detail pass: literal VLM inventory → structured numeric blueprint.
+ * This is what the geometry model receives, so shapes seen in the photos
+ * survive all the way into ops.
+ */
+async function extractVisualSpec(sheet: string, term: string): Promise<string | null> {
+  try {
+    const res = await fetch('/api/media/describe', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ image: sheet, prompt: `${LITERAL_PROMPT}\nThe object: "${term}"` }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) return null;
+    const literal = String(data.description ?? '').trim();
+    if (literal.length < 80 || !SHAPE_WORDS.test(literal)) return null;
+
+    const { text } = await aiChatSync(
+      `${SPEC_PROMPT}\n\nOBJECT: "${term}"\nLITERAL DESCRIPTION:\n${literal.slice(0, 2400)}`,
+      'sdf-visual-spec',
+      45000,
+    );
+    const spec = text.trim();
+    // A real spec has the section headers and multiple part lines.
+    if (!/OVERALL:/i.test(spec) || (spec.match(/^\s*-\s/gm)?.length ?? 0) < 2) return null;
+    return spec.slice(0, 2000);
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Full grounding pass. Never throws; degrades to {mode:'none'} so generation
  * proceeds ungrounded rather than blocked.
@@ -172,7 +214,9 @@ export async function getReferenceGrounding(term: string, timeoutMs = 15000): Pr
     }
     if (!tiled) return NONE;
 
-    const notes = await extractNotes(tiled.sheet, term);
+    // Rich numeric blueprint first (describe → structure); the short template
+    // notes remain as the fallback when either stage comes back empty.
+    const notes = (await extractVisualSpec(tiled.sheet, term)) ?? (await extractNotes(tiled.sheet, term));
     return { notes, mode, count: tiled.used.length, sources: tiled.used, sheet: tiled.sheet };
   } catch {
     return NONE;

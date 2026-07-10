@@ -131,7 +131,7 @@ const EPS = 1e-3;
 const GPU_PRIMS = new Set<PrimKind>(['sphere', 'box', 'capsule', 'torus', 'ellipsoid', 'cone', 'hex', 'octahedron']);
 const gpuEligible = (p: ShapeProgram) => {
   const e = expandProgram(p);
-  return e.ops.length <= 64 && e.ops.every(o => GPU_PRIMS.has(o.prim));
+  return e.ops.length <= 96 && e.ops.every(o => GPU_PRIMS.has(o.prim));
 };
 
 function meshPositions(group: import('three').Group): Float32Array {

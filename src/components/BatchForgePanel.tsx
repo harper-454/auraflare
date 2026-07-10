@@ -50,7 +50,7 @@ export function BatchForgePanel({ onModelReady }: {
     for (let i = 0; i < prompts.length; i++) {
       if (stopRef.current) { patch(i, { status: 'failed', detail: 'stopped' }); continue; }
       try {
-        const result = await forgeModel(prompts[i], { qa: !fastMode }, stage => patch(i, { status: stage }));
+        const result = await forgeModel(prompts[i], { qa: !fastMode, detail: !fastMode }, stage => patch(i, { status: stage }));
         onModelReady(result, prompts[i]);
         let saveNote = '';
         try { await saveModelArtifacts(prompts[i], result); } catch { saveNote = ' · SAVE FAILED'; }
